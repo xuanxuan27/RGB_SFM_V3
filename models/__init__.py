@@ -1,10 +1,11 @@
-from . import CNN, SFMCNN, RGB_SFMCNN , RGB_SFMCNN_V2, AlexNet, ResNet, GoogLeNet, DenseNet, VIT, RGB_SFM_VIT, VIT_with_Partial_LRP, PVT, RGB_SFM_PVT, VIT_SmallPatch, VIT_SmallPatch_ver2, RegisterViT, VIT_with_Partial_LRP_RegisterAware, vit_lrt_register_token, PVTv2_B0
+from . import CNN, SFMCNN, RGB_SFMCNN , RGB_SFMCNN_V2, RGB_SFMCNN_V3, AlexNet, ResNet, GoogLeNet, DenseNet, VIT, RGB_SFM_VIT, VIT_with_Partial_LRP, PVT, RGB_SFM_PVT, VIT_SmallPatch, VIT_SmallPatch_ver2, RegisterViT, VIT_with_Partial_LRP_RegisterAware, vit_lrt_register_token, PVTv2_B0
 
 __all__ = ['CNN', 
            'SFMCNN', 
            'AlexNet', 
            "RGB_SFMCNN",
            "RGB_SFMCNN_V2",
+           "RGB_SFMCNN_V3",
            'ResNet',
            'GoogLeNet',
            'DenseNet',

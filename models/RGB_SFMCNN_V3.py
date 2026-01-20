@@ -16,6 +16,8 @@ from config import config, arch
 
 '''
 來自 2026 葉容瑄的碩士論文:
+目標是把 gray 路徑改成使用 RGB 三個 filter 再送進高斯及後續模組
+並且改成不使用 RGB 模組處理彩色圖片
 '''
 
 def get_feature_extraction_layers(model):
@@ -199,8 +201,9 @@ class RGB_SFMCNN_V3(nn.Module):
 
         # ========== Gray 分支 ==========
         if self.mode in ['gray', 'both']:
+            # 使用 RGB_Only_Conv2d 需要 3 個輸入通道（RGB）
             GRAY_conv2d = self._make_GrayBlock(
-                1,
+                3,  # 改為 3，因為 RGB_Only_Conv2d 需要 RGB 輸入
                 channels[1][0],
                 Conv2d_kernel[1][0],
                 stride=strides[1][0],
@@ -265,8 +268,8 @@ class RGB_SFMCNN_V3(nn.Module):
                     features_list.append(rgb_out)
                 
                 if self.mode in ['gray', 'both']:
-                    gray_in = self.gray_transform(dummy_input)
-                    gray_out = self.Gray_convs(gray_in)
+                    # 使用 RGB_Only_Conv2d，直接使用 RGB 輸入，不需要 gray_transform
+                    gray_out = self.Gray_convs(dummy_input)  # 直接使用 RGB 輸入
                     gray_out = gray_out.reshape(1, -1)
                     features_list.append(gray_out)
                 
@@ -298,8 +301,8 @@ class RGB_SFMCNN_V3(nn.Module):
             # print(f"rgb_output{rgb_output.shape}")
 
         if self.mode in ['gray', 'both']:
-            gray_input = self.gray_transform(x)
-            gray_output = self.Gray_convs(gray_input)
+            # 使用 RGB_Only_Conv2d，直接使用 RGB 輸入，不需要 gray_transform
+            gray_output = self.Gray_convs(x)  # 直接使用 RGB 輸入
             gray_output = gray_output.reshape(x.shape[0], -1)
             # print(f"gray_output{gray_output.shape}")
             features.append(gray_output)
@@ -369,8 +372,19 @@ class RGB_SFMCNN_V3(nn.Module):
         layers = []
         # gray 卷基層
         out_channel = out_channels[0] * out_channels[1]
-        rgb_conv_layer = Gray_Conv2d(in_channel, out_channel, kernel_size=kernel_size, stride=stride, padding=padding,
-                            initial=initial, conv_method=conv_method, device=device)
+        # 將 conv_method 映射到 method 參數
+        # conv_method 可能是 "cdist", "dot_product", "squared_cdist", "cosine"
+        # RGB_Only_Conv2d 的 method 是 "lab_distance", "convolution", "euclidean"
+        method_mapping = {
+            "cdist": "euclidean",  # cdist 類似歐幾里得距離
+            "dot_product": "convolution",  # dot_product 就是標準卷積
+            "squared_cdist": "euclidean",  # squared_cdist 也類似歐幾里得
+            "cosine": "euclidean"  # cosine 暫時映射到 euclidean
+        }
+        method = method_mapping.get(conv_method, "convolution")  # 預設使用 convolution
+        
+        rgb_conv_layer = RGB_Only_Conv2d(in_channel, out_channel, kernel_size=kernel_size, stride=stride, padding=padding,
+                            initial=initial, device=device)
         # 建立響應模組
         rbf_layer = make_rbfs(rbfs, activate_param, device, required_grad=True)
         # 建立空間合併模組
@@ -425,7 +439,6 @@ class RGB_SFMCNN_V3(nn.Module):
 
 import torch
 import torch.nn as nn
-
 
 class RGB_Conv2d(nn.Module):
     def __init__(self,
@@ -624,6 +637,254 @@ class RGB_Conv2d(nn.Module):
         return h, s, v
 
 
+
+'''
+    RGB Only Conv2d
+    return output shape = (batches, channels, height, width)
+'''
+
+
+class RGB_Only_Conv2d(nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size: tuple,
+                 stride: int = 1,
+                 padding: int = 0,
+                 initial: str = "kaiming",
+                 requires_grad: bool = False,
+                 method: str = "lab_distance",
+                 device=None,
+                 dtype=None) -> None:
+        """
+        將灰階路徑改成使用 RGB 三個 filter 再送進後續模組
+        
+        Args:
+            in_channels: 輸入通道數（應該是 3，對應 RGB）
+            out_channels: 輸出通道數（總輸出通道數，會是 3 的倍數）
+            kernel_size: 卷積核大小 (h, w)
+            stride: 步長
+            padding: 填充
+            initial: 初始化方法（此處不使用，因為使用固定的 RGB filter）
+            requires_grad: 權重是否可訓練
+            method: 計算方式
+                - "lab_distance": LAB 顏色距離（類似 RGB_Conv2d，目前預設）
+                - "convolution": 標準卷積（類似 Gray_Conv2d 的 dot_product）
+                - "euclidean": 歐幾里得距離
+            device: 設備
+            dtype: 數據類型
+        """
+        super().__init__()
+        
+        assert in_channels == 3, "RGB_Only_Conv2d 需要 3 個輸入通道（RGB）"
+        
+        kernel_h, kernel_w = kernel_size
+        
+        # 只有三個 filter: [255,0,0], [0,255,0], [0,0,255]
+        weights = [[255, 0, 0], [0, 255, 0], [0, 0, 255]]
+        
+        # 轉成 tensor 並正規化，shape: (3, 3)
+        weight_tensor = torch.tensor(weights, dtype=dtype, device=device) / 255.0
+        
+        # 變成 shape: (3, 3, 1, 1)
+        weight_tensor = weight_tensor.unsqueeze(-1).unsqueeze(-1)
+        
+        # 轉成 shape: (3, 1, 1, 3)
+        weight_tensor = weight_tensor.permute(0, 2, 3, 1)
+        
+        # 擴展成 shape: (3, kernel_h, kernel_w, 3) -> (filter_num, kernel_h, kernel_w, channel_num)
+        weight_tensor = weight_tensor.repeat(1, kernel_h, kernel_w, 1)
+        
+        # 註冊為可訓練參數
+        self.weight = nn.Parameter(weight_tensor, requires_grad=requires_grad)
+        
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.initial = initial
+        self.method = method
+    
+    def forward(self, input_tensor):
+        """
+        前向傳播
+        根據 method 參數選擇不同的計算方式
+        
+        Args:
+            input_tensor: (B, 3, H, W) RGB 影像
+        
+        Returns:
+            output: (B, out_channels, H', W') 輸出
+        """
+        if self.method == "lab_distance":
+            return self._forward_lab_distance(input_tensor)
+        elif self.method == "convolution":
+            return self._forward_convolution(input_tensor)
+        elif self.method == "euclidean":
+            return self._forward_euclidean(input_tensor)
+        else:
+            raise ValueError(f"Unknown method: {self.method}")
+    
+    def _forward_lab_distance(self, input_tensor):
+        """
+        LAB 顏色距離（類似 RGB_Conv2d）
+        """
+        # input_tensor shape: (B, 3, H, W)
+        unfold = torch.nn.Unfold(kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+        # input_unfolded shape: (B, 3*kernel_h*kernel_w, L)
+        input_unfolded = unfold(input_tensor)
+        
+        height, width = int(input_unfolded.shape[2] ** 0.5), int(input_unfolded.shape[2] ** 0.5)
+        # input_unfolded shape: (B, 3, kernel_h, kernel_w, height, width)
+        input_unfolded = input_unfolded.view(-1, 3, self.kernel_size[0], self.kernel_size[1], height, width)
+        input_unfolded = input_unfolded.permute(0, 4, 5, 1, 2, 3)  # (B, height, width, 3, kernel_h, kernel_w)
+        
+        # 類似 RGB_Conv2d，對完整的 RGB patch 計算與三個 filter 的 LAB 距離
+        permute_weight = self.weight.permute(0, 3, 1, 2)  # (3, 3, kernel_h, kernel_w)
+        # weights shape: (3, 3, kernel_h, kernel_w) - 三個 filter，每個都是完整的 RGB
+        
+        # 計算每個 RGB patch 與三個 filter 的距離
+        distances = self.batched_LAB_distance(
+            input_unfolded.unsqueeze(1),  # (B, 1, height, width, 3, kernel_h, kernel_w)
+            permute_weight.unsqueeze(0).unsqueeze(2).unsqueeze(3)  # (1, 3, 1, 1, 3, kernel_h, kernel_w)
+        )
+        # distances shape: (B, 3, height, width) - 每個位置對應三個 filter 的距離
+        
+        return self._expand_channels(distances)
+    
+    def _forward_convolution(self, input_tensor):
+        """
+        標準卷積（類似 Gray_Conv2d 的 dot_product）
+        """
+        # 將 weight 轉換成卷積格式: (3, 3, kernel_h, kernel_w)
+        conv_weight = self.weight.permute(0, 3, 1, 2)  # (3, 3, kernel_h, kernel_w)
+        
+        # 使用標準卷積
+        output = F.conv2d(input_tensor, conv_weight, stride=self.stride, padding=self.padding)
+        # output shape: (B, 3, H', W')
+        
+        return self._expand_channels(output)
+    
+    def _forward_euclidean(self, input_tensor):
+        """
+        歐幾里得距離
+        """
+        # input_tensor shape: (B, 3, H, W)
+        unfold = torch.nn.Unfold(kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+        input_unfolded = unfold(input_tensor)  # (B, 3*kernel_h*kernel_w, L)
+        
+        height, width = int(input_unfolded.shape[2] ** 0.5), int(input_unfolded.shape[2] ** 0.5)
+        input_unfolded = input_unfolded.view(-1, 3, self.kernel_size[0], self.kernel_size[1], height, width)
+        input_unfolded = input_unfolded.permute(0, 4, 5, 1, 2, 3)  # (B, height, width, 3, kernel_h, kernel_w)
+        
+        # 將 weight 轉換: (3, kernel_h, kernel_w, 3) -> (3, 3, kernel_h, kernel_w)
+        permute_weight = self.weight.permute(0, 3, 1, 2)  # (3, 3, kernel_h, kernel_w)
+        
+        # 計算歐幾里得距離
+        # 將 input 和 weight 都 flatten
+        input_flat = input_unfolded.reshape(-1, 3 * self.kernel_size[0] * self.kernel_size[1])  # (B*H*W, 3*kernel_h*kernel_w)
+        weight_flat = permute_weight.reshape(3, 3 * self.kernel_size[0] * self.kernel_size[1])  # (3, 3*kernel_h*kernel_w)
+        
+        # 計算距離: (B*H*W, 3)
+        distances = torch.cdist(input_flat, weight_flat)  # (B*H*W, 3)
+        
+        # Reshape: (B, H, W, 3) -> (B, 3, H, W)
+        distances = distances.reshape(input_tensor.shape[0], height, width, 3).permute(0, 3, 1, 2)
+        
+        return self._expand_channels(distances)
+    
+    def _expand_channels(self, output):
+        """
+        擴展輸出通道數以符合 out_channels
+        """
+        # output shape: (B, 3, H', W')
+        # 如果 out_channels > 3，需要擴展輸出通道數
+        filters_per_channel = self.out_channels // 3
+        if filters_per_channel > 1:
+            # 重複每個 filter 的結果
+            # output: (B, 3, H', W') -> (B, 3, 1, H', W') -> (B, 3, filters_per_channel, H', W')
+            output = output.unsqueeze(2).repeat(1, 1, filters_per_channel, 1, 1)
+            # Reshape: (B, 3, filters_per_channel, H', W') -> (B, 3*filters_per_channel, H', W')
+            output = output.reshape(output.shape[0], -1, output.shape[3], output.shape[4])
+        
+        # 如果 out_channels 不是 3 的倍數，補齊或截斷
+        current_channels = output.shape[1]
+        if current_channels < self.out_channels:
+            # 補齊：重複最後的通道
+            diff = self.out_channels - current_channels
+            output = torch.cat([output, output[:, -diff:, :, :]], dim=1)
+        elif current_channels > self.out_channels:
+            # 截斷：只保留前 out_channels 個通道
+            output = output[:, :self.out_channels, :, :]
+        
+        return output
+    
+    def batched_LAB_distance(self, windows_RGBcolor, weights_RGBcolor):
+        """
+        LAB Distance 計算（類似 RGB_Conv2d）
+        """
+        # RGB 顏色數據從 [0, 1] 映射到 [0, 255]
+        R_1, G_1, B_1 = (windows_RGBcolor[:, :, :, :, 0] * 255, 
+                         windows_RGBcolor[:, :, :, :, 1] * 255,
+                         windows_RGBcolor[:, :, :, :, 2] * 255)
+        R_2, G_2, B_2 = (weights_RGBcolor[:, :, :, :, 0] * 255, 
+                         weights_RGBcolor[:, :, :, :, 1] * 255, 
+                         weights_RGBcolor[:, :, :, :, 2] * 255)
+        
+        # 計算 rmean 作為矩陣形式
+        rmean = (R_1 + R_2) / 2
+        
+        # 計算 RGB 分量的差異
+        R = R_1 - R_2
+        G = G_1 - G_2
+        B = B_1 - B_2
+        
+        # 計算加權的歐幾里得距離
+        distance = torch.sqrt(
+            (2 + rmean / 256) * (R ** 2) +
+            4 * (G ** 2) +
+            (2 + (255 - rmean) / 256) * (B ** 2) +
+            1e-8
+        ).sum(dim=4).sum(dim=4)
+        
+        distance = distance / (self.kernel_size[0] * self.kernel_size[1] * 768)
+        
+        return distance
+    
+    def extra_repr(self) -> str:
+        method_str = {
+            "lab_distance": "LAB",
+            "convolution": "Conv",
+            "euclidean": "Euclidean"
+        }.get(self.method, self.method)
+        return f"in_channels={self.in_channels}, out_channels={self.out_channels}, kernel_size={self.kernel_size}, method={method_str}, filters=[R,G,B]"
+
+
+    # 使用餘弦相似度
+    def _cosine(self, input: Tensor) -> Tensor:
+        output_width = math.floor(
+            (input.shape[-1] + self.padding * 2 - (self.kernel_size[0] - 1) - 1) / self.stride[0] + 1)
+        output_height = math.floor(
+            (input.shape[-2] + self.padding * 2 - (self.kernel_size[1] - 1) - 1) / self.stride[1] + 1)
+        # Unfold output = (batch, output_width * output_height, C×∏(kernel_size))
+        windows = F.unfold(input, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding).permute(0, 2, 1)
+
+        # 計算 windows 和 weight 的 L2 範數
+        windows_norm = torch.norm(windows, p=2, dim=2, keepdim=True)
+        weight_norm = torch.norm(self.weight, p=2, dim=1, keepdim=True)
+
+
+        # 計算點積
+        dot_product = torch.matmul(windows, self.weight.t())
+
+
+        # 計算餘弦相似度
+        cosine = dot_product / (windows_norm * weight_norm.t() + 1e-8)
+        # 調整維度順序並重塑
+        result = cosine.permute(0, 2, 1)
+        result = result.reshape(result.shape[0], result.shape[1], output_height, output_width)
+        return result
 
 '''
     Gray 卷積層
