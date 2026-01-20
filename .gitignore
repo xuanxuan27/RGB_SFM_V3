@@ -23,3 +23,13 @@ single_detect/
 
 .idea/
 config/
+
+2025_analyze/
+.vscode/
+caltech101_images/
+cifar10_images/
+config_example copy.py
+config_v3.py
+head_analysis_results/
+pvt_analysis_output/
+vit_analysis_output/
