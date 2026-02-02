@@ -1,4 +1,4 @@
-from . import CNN, SFMCNN, RGB_SFMCNN , RGB_SFMCNN_V2, AlexNet, ResNet, GoogLeNet, DenseNet
+from . import CNN, SFMCNN, RGB_SFMCNN , RGB_SFMCNN_V2, RGB_SFMCNN_V3, AlexNet, ResNet, GoogLeNet, DenseNet
 
 __all__ = ['CNN', 
            'SFMCNN', 
@@ -7,4 +7,5 @@ __all__ = ['CNN',
            "RGB_SFMCNN_V2",
            'ResNet',
            'GoogLeNet',
-           'DenseNet']
+           'DenseNet',
+           'RGB_SFMCNN_V3']

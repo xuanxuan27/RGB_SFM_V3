@@ -154,10 +154,8 @@ class RGB_SFMCNN_V3(nn.Module):
         assert self.mode in ['rgb', 'gray', 'both'], "mode must be 'rgb', 'gray', or 'both'"
 
         if self.mode in ['gray', 'both']:
-            self.gray_transform = torchvision.transforms.Compose([
-                torchvision.transforms.Grayscale(),
-                NormalizeToRange()
-            ])
+            # 保留 RGB 三通道，只做尺度正規化到 [-1, 1]
+            self.gray_normalize = NormalizeToRange()
 
         # ========== RGB 分支 ==========
         if self.mode in ['rgb', 'both']:
@@ -268,8 +266,8 @@ class RGB_SFMCNN_V3(nn.Module):
                     features_list.append(rgb_out)
                 
                 if self.mode in ['gray', 'both']:
-                    # 使用 RGB_Only_Conv2d，直接使用 RGB 輸入，不需要 gray_transform
-                    gray_out = self.Gray_convs(dummy_input)  # 直接使用 RGB 輸入
+                    # 與實際 forward 一致：先做 Normalize，再進灰分支
+                    gray_out = self.Gray_convs(self.gray_normalize(dummy_input))
                     gray_out = gray_out.reshape(1, -1)
                     features_list.append(gray_out)
                 
@@ -301,8 +299,8 @@ class RGB_SFMCNN_V3(nn.Module):
             # print(f"rgb_output{rgb_output.shape}")
 
         if self.mode in ['gray', 'both']:
-            # 使用 RGB_Only_Conv2d，直接使用 RGB 輸入，不需要 gray_transform
-            gray_output = self.Gray_convs(x)  # 直接使用 RGB 輸入
+            # 只做 Normalize，不轉灰階，維持 RGB 三 filter
+            gray_output = self.Gray_convs(self.gray_normalize(x))
             gray_output = gray_output.reshape(x.shape[0], -1)
             # print(f"gray_output{gray_output.shape}")
             features.append(gray_output)
@@ -484,7 +482,7 @@ class RGB_Conv2d(nn.Module):
                        [115, 233, 72], [189, 211, 189], [109, 215, 133], [72, 131, 77], [69, 81, 65], [77, 212, 193],
                        [101, 159, 190], [120, 142, 215], [121, 102, 215], [111, 42, 240], [75, 42, 185], [57, 41, 119],
                        [42, 46, 71], [216, 129, 199], [214, 67, 205], [147, 107, 128], [136, 48, 133], [0, 0, 0]]
-        elif color_filter == "new_100":
+        elif color_filter == "new_100":  
             weights = [[255, 254, 255], [224, 171, 174], [208, 148, 123], [226, 122, 151], [236, 120, 28], [227, 116, 66], [224, 116, 91], [240, 97, 150], [182, 111, 146], [236, 60, 40], [199, 95, 95], [236, 50, 79], [140, 108, 101], [204, 35, 113], [199, 38, 71], [161, 74, 25], [153, 53, 87], [122, 71, 54], [149, 34, 24], [89, 63, 60], [96, 51, 9], [124, 10, 40], [79, 43, 31], [84, 11, 24], [236, 237, 213], [241, 227, 14], [154, 247, 30], [209, 219, 136], [217, 217, 48], [189, 220, 77], [239, 197, 153], [232, 185, 82], [238, 169, 27], [175, 162, 102], [181, 161, 75], [174, 165, 43], [211, 141, 61], [120, 154, 13], [121, 141, 53], [155, 113, 70], [145, 115, 25], [81, 86, 39], [36, 38, 28], [160, 234, 179], [76, 243, 84], [167, 230, 121], [105, 224, 101], [136, 218, 58], [82, 222, 137], [169, 187, 158], [48, 186, 56], [117, 177, 100], [114, 146, 110], [67, 150, 44], [90, 109, 94], [54, 113, 42], [33, 76, 45], [172, 234, 229], [35, 251, 196], [73, 214, 179], [98, 196, 202], [77, 167, 207], [50, 148, 117], [66, 114, 139], [47, 115, 116], [35, 55, 67], [155, 183, 231], [181, 162, 225], [166, 166, 176], [100, 155, 239], [50, 132, 239], [153, 106, 208], [124, 120, 186], [74, 93, 212], [98, 102, 143], [121, 69, 210], [68, 51, 240], [62, 76, 155], [54, 33, 183], [37, 58, 113], [28, 22, 136], [48, 19, 89], [33, 30, 63], [226, 185, 215], [242, 155, 229], [196, 134, 214], [234, 105, 227], [230, 88, 180], [228, 35, 229], [253, 0, 159], [185, 65, 213], [205, 39, 170], [146, 35, 247], [162, 60, 139], [104, 81, 105], [109, 49, 110], [112, 28, 134], [96, 24, 64], [45, 22, 36], [0, 0, 0]]
         elif color_filter == "new_10":
             weights = [[255, 254, 255], [194, 73, 71], [77, 58, 63], [200, 156, 76], [132, 206, 76], [124, 184, 150], [145, 147, 195], [102, 58, 189], [194, 74, 165], [0, 0, 0]]
@@ -652,8 +650,8 @@ class RGB_Only_Conv2d(nn.Module):
                  stride: int = 1,
                  padding: int = 0,
                  initial: str = "kaiming",
-                 requires_grad: bool = False,
-                 method: str = "lab_distance",
+                 requires_grad: bool = True,
+                 method: str = "euclidean",
                  device=None,
                  dtype=None) -> None:
         """
