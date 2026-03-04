@@ -31,3 +31,6 @@ caltech101_images/
 cifar10_images/
 vit_analysis_output/
 pvt_analysis_output/
+
+mergingViT_plot_tool/plots/
+config_v3.py
