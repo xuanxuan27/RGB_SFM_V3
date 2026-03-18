@@ -23,7 +23,7 @@ from .AnotherColored_FashionMNIST import AnotherColored_FashionMNIST
 from .CIFAR10 import CIFAR10
 from .Colorful_MNIST import Colorful_MNIST
 from torchvision import transforms
-
+from .Caltech101 import Caltech101Dataset
 dataset_classes = {
     'mnist': MNISTDataset,
     'MultiColor_Shapes_Database': MultiColorShapesDataset,
@@ -48,24 +48,46 @@ dataset_classes = {
     "RetinaMNIST_224" : CustomerRetinaMNIST_224,
     "BloodMNIST" :  CustomerBloodMNIST,
     'APROS_2019' : APROS_2019Dataset,
-    'PreprocessedRetinaMNIST224' : PreprocessedRetinaMNIST224
+    'PreprocessedRetinaMNIST224' : PreprocessedRetinaMNIST224,
+    'Caltech101' : Caltech101Dataset
 }
 
 
 
 def get_dataloader(dataset, root: str = '.', batch_size=32, input_size: tuple = (28, 28)):
     if dataset in dataset_classes:
-        train_transform = transforms.Compose([
-            transforms.Resize([*input_size]),
-            transforms.ToTensor(),
-            transforms.ConvertImageDtype(torch.float),
-        ])
+        # 對 Caltech101 使用較強的 data augmentation，其餘資料集維持原本的 resize + to tensor
+        if dataset == 'Caltech101':
+            # Train：RandomResizedCrop + Flip +（可選）ColorJitter
+            train_transform = transforms.Compose([
+                transforms.RandomResizedCrop(input_size[0], scale=(0.6, 1.0)),
+                transforms.Lambda(lambda img: img.convert('RGB')),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(
+                    brightness=0.2,
+                    contrast=0.2,
+                    saturation=0.2,
+                    hue=0.0,
+                ),
+                transforms.ToTensor(),
+                transforms.ConvertImageDtype(torch.float),
+            ])
 
-        test_transform = transforms.Compose([
-            transforms.Resize([*input_size]),
-            transforms.ToTensor(),
-            transforms.ConvertImageDtype(torch.float),
-        ])
+            # Test/Val：只做 deterministic 的 Resize + 轉 RGB
+            test_transform = transforms.Compose([
+                transforms.Resize([*input_size]),
+                transforms.Lambda(lambda img: img.convert('RGB')),
+                transforms.ToTensor(),
+                transforms.ConvertImageDtype(torch.float),
+            ])
+        else:
+            common_transforms = [
+                transforms.Resize([*input_size]),
+                transforms.ToTensor(),
+                transforms.ConvertImageDtype(torch.float),
+            ]
+            train_transform = transforms.Compose(common_transforms)
+            test_transform = transforms.Compose(common_transforms)
 
         print(dataset_classes[dataset])
 

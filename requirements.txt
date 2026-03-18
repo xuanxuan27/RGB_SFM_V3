@@ -1,19 +1,34 @@
-grad_cam==1.5.4
-matplotlib==3.10.3
+# Deep Learning
+torch==2.4.1
+torchvision==0.19.1
+torchsummary==1.5.1
+
+# Grad-CAM (import: pytorch_grad_cam)
+grad-cam==1.5.4
+
+# Data & Datasets
 medmnist==3.0.2
 mlxtend==0.23.1
 numpy==1.26.4
-opencv_python==4.10.0.84
 pandas==2.3.0
 Pillow==11.2.1
-plotly==5.24.1
-scikit_learn==1.7.0
-scipy==1.15.3
-seaborn==0.13.2
-Shapely==2.1.1
+
+# Image Processing
+opencv-python==4.10.0.84
 scikit-image==0.22.0
-torch==2.4.1
-torchsummary==1.5.1
-torchvision==0.19.1
+
+# Scientific Computing
+scipy==1.15.3
+scikit-learn==1.7.0
+
+# Visualization
+matplotlib==3.10.3
+seaborn==0.13.2
+plotly==5.24.1
+
+# Geometry (heart_calcification)
+Shapely==2.1.1
+
+# Utilities
 tqdm==4.66.5
 wandb==0.18.0

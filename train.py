@@ -27,14 +27,14 @@ def train(train_dataloader: DataLoader, valid_dataloader: DataLoader, model: nn.
     best_valid_loss =  float('inf')
     count = 0
     patience = config['patience']
-    # 使用影像前處理
+    # ???????
     use_preprocessed_image= config['use_preprocessed_image']
     checkpoint = {}
 
-    # 需要計算 RM 分布指標
+    # ???? RM ????
     need_calculate_status = arch["need_calculate_status"]
     if need_calculate_status:
-        # 使否使用輪廓層
+        # ???????
         mode = arch['args']['mode']
         use_gray = mode in ['gray', 'both']
         rgb_layers, gray_layers = get_basic_target_layers(model, use_gray=use_gray)
@@ -51,32 +51,37 @@ def train(train_dataloader: DataLoader, valid_dataloader: DataLoader, model: nn.
             X, y = next(iter(train_dataloader))
             for batch, (X, y) in progress:
                 X = X.to(device); y= y.to(device)
-                # 使用影像愈處理
+                # ???????
                 if use_preprocessed_image:
                     X = preprocess_retinal_tensor_batch(X, final_size=config['input_shape'])
 
                 pred = model(X)
-                # 判斷是否使用 metric-based loss
+                # ?????? metric-based loss
                 if use_metric_based_loss:
                     loss = training_loss_fn(pred, y, model, rgb_layers, gray_layers, X)
                 else:
                     loss = eval_loss_fn(pred, y)
 
-                # 反向传播
+                # ????
                 loss.backward()
-                # 更新模型参数
+                # ??????
                 optimizer.step()
                     
-                # 清零梯度
+                # ????
                 optimizer.zero_grad()
                 
-                losses                  += loss.detach().item()
+                losses += loss.detach().item()
                 size += len(X)
-                
-                correct += (pred.argmax(1) == y.argmax(1)).type(torch.float).sum().item()
 
-                train_loss = losses/(batch+1)
-                train_acc = correct/size
+                if y.dim() == 1:
+                    targets = y
+                else:
+                    targets = y.argmax(1)
+
+                correct += (pred.argmax(1) == targets).type(torch.float).sum().item()
+
+                train_loss = losses / (batch + 1)
+                train_acc = correct / size
                 progress.set_description("Loss: {:.7f}, Accuracy: {:.7f}".format(train_loss, train_acc))
 
             valid_acc, valid_loss, _ = eval(valid_dataloader, model, eval_loss_fn, False, device = device, use_preprocessed_image=use_preprocessed_image)
@@ -128,10 +133,22 @@ def train(train_dataloader: DataLoader, valid_dataloader: DataLoader, model: nn.
                 checkpoint['train_acc'] = train_acc
                 checkpoint['valid_loss'] = valid_loss
                 checkpoint['valid_acc'] = valid_acc
+                checkpoint['best_epoch'] = e
 
-                torch.save(checkpoint, f'{config["save_dir"]}/epochs{e}.pth')
-            if e == 200:
-                torch.save(checkpoint, f'{config["save_dir"]}/epochs{e}.pth')
+                save_path = f'{config["save_dir"]}/best_epoch.pth'
+                try:
+                    torch.save(checkpoint, save_path)
+                except (OSError, RuntimeError) as err:
+                    if getattr(err, 'errno', None) == 28 or 'space' in str(err).lower():
+                        print("Warning: Disk full, skip saving checkpoint.")
+                    else:
+                        raise
+            if e == 200 and checkpoint:
+                try:
+                    torch.save(checkpoint, f'{config["save_dir"]}/epochs{e}.pth')
+                except (OSError, RuntimeError) as err:
+                    if getattr(err, 'errno', None) == 28 or 'space' in str(err).lower():
+                        print("Warning: Disk full, skip epochs save.")
 
                 
     # print(model)
@@ -143,10 +160,10 @@ def train(train_dataloader: DataLoader, valid_dataloader: DataLoader, model: nn.
     #     images = torch.cat((images, imgs.to(device)))
     #     labels = torch.cat((labels, lbls.to(device)))
 
-    # 需要計算 RM 分布指標
+    # é??è¦è¨?ç®? RM å??å¸?æ??æ¨?
     # need_calculate_status = arch["need_calculate_status"]
     # if need_calculate_status:
-    #     use_gray = arch['args']['use_gray']  # 使否使用輪廓層
+    #     use_gray = arch['args']['use_gray']  # ä½¿å¦ä½¿ç?¨è¼ªå»?å±¤
     #     rgb_layers, gray_layers = get_basic_target_layers(model, use_gray=use_gray)
     #     layer_stats, overall_stats = get_all_layers_stats(model, rgb_layers, gray_layers, images)
     #
@@ -168,28 +185,36 @@ def eval(dataloader: DataLoader, model: nn.Module, loss_fn, need_table = True, d
     with torch.no_grad():
         for batch, (X, y) in progress:
             X = X.to(device); y= y.to(device)
-
-            # 使用影像愈處理
+            # ???????
             if use_preprocessed_image:
                 X = preprocess_retinal_tensor_batch(X, final_size=config['input_shape'])
 
             pred = model(X)
             loss = loss_fn(pred, y)
-            
+
             losses += loss.detach().item()
             size += len(X)
-            correct += (pred.argmax(1) == y.argmax(1)).type(torch.float).sum().item()
+
+            if y.dim() == 1:
+                targets = y
+            else:
+                targets = y.argmax(1)
+
+            correct += (pred.argmax(1) == targets).type(torch.float).sum().item()
 
             if need_table:
                 X = X.cpu()
                 y = y.cpu()
-                
+                targets_cpu = targets.cpu()
+
                 # sample first image in batch 
                 if X[0].shape[0] == 3:
                     X = np.transpose(np.array(X[0]), (1, 2, 0))
                 else:
                     X = np.array(X[0])
-                table.append([wandb.Image(X), y[0], pred.argmax(1)[0], loss, (pred.argmax(1) == y.argmax(1)).type(torch.float).sum().item()])
+
+                batch_correct = (pred.argmax(1) == targets).type(torch.float).sum().item()
+                table.append([wandb.Image(X), targets_cpu[0], pred.argmax(1)[0], loss, batch_correct])
 
             test_loss = losses/(batch+1)
             test_acc = correct/size
@@ -267,11 +292,12 @@ print(f'checkpoint keys: {checkpoint.keys()}')
 # 儲存模型到 run 中
 torch.save(checkpoint, f'{config["save_dir"]}/{config["model"]["name"]}_best.pth')
 
+
 # 儲存模型到 pth 中
 load_model_name= config["load_model_name"]
 load_model_path = f'./pth/{config["dataset"]}'
 if not os.path.exists(load_model_path):
-    os.makedirs(load_model_path)  # 建立資料夾
+    os.makedirs(load_model_path)  # ?????
 torch.save(checkpoint, load_model_path + f'/{load_model_name}.pth')
 
 art = wandb.Artifact(f'{config["model"]["name"]}_{config["dataset"]}', type="model")

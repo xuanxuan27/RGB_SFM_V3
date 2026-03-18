@@ -168,10 +168,11 @@ class TransformerBlock(nn.Module):
     def __init__(self, dim, num_heads=8, mlp_ratio=4., qkv_bias=False, drop=0.):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, num_heads, qkv_bias, drop)
+        # ViT: attn_drop 在 attention weights 後，proj_drop 在 output projection 後
+        self.attn = Attention(dim, num_heads, qkv_bias, attn_drop=drop, proj_drop=drop)
         
         self.norm2 = nn.LayerNorm(dim)
-        # mlp_ratio 通常設為 4，這就是隱藏層變胖 4 倍的地方
+        # mlp_ratio 通常設為 4，這就是隱藏層變胖 4 倍的地方；ViT: MLP 內兩處 dropout
         self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), drop=drop)
 
     def forward(self, x):
@@ -182,7 +183,7 @@ class TransformerBlock(nn.Module):
 
 class MergingViT(nn.Module):
     def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=10, 
-                 embed_dims=[64, 128, 256, 512], depths=[1, 1, 1, 1]):
+                 embed_dims=[64, 128, 256, 512], depths=[1, 1, 1, 1], merge_size=2, drop_rate=0.1):
         super().__init__()
         
         # 1. 初始 Patch Embedding (通常第一層切較大，如 4x4)
@@ -195,28 +196,48 @@ class MergingViT(nn.Module):
         self.merges = nn.ModuleList()
         
         num_stages = len(depths)
-        
+        num_merges = num_stages - 1
+
+        # 正規化 merge_size：支援 per-stage 設定
+        # 範例: 2 → [(2,2), (2,2), ...]；[(2,2),(3,3),(3,3)] → 依序使用
+        if isinstance(merge_size, int):
+            merge_sizes = [(merge_size, merge_size)] * num_merges
+        elif isinstance(merge_size, (list, tuple)) and len(merge_size) > 0:
+            first = merge_size[0]
+            if isinstance(first, (list, tuple)) and len(first) == 2:
+                # [(2,2), (3,3), (3,3)] 或 ((2,2), (4,1), (4,1))
+                merge_sizes = [(int(m[0]), int(m[1])) for m in merge_size]
+                assert len(merge_sizes) == num_merges, \
+                    f"merge_size 長度 {len(merge_sizes)} 應等於 merge 次數 {num_merges}"
+            else:
+                # (2, 2) 或 (3, 3) 單一 tuple
+                merge_sizes = [(int(merge_size[0]), int(merge_size[1]))] * num_merges
+        else:
+            merge_sizes = [(2, 2)] * num_merges
+
         for i in range(num_stages):
             # A. 建立當前 Stage 的位置編碼
             self.pos_embeds.append(nn.Parameter(torch.zeros(1, h * w, embed_dims[i])))
             
-            # B. 建立當前 Stage 的 Transformer Blocks
+            # B. 建立當前 Stage 的 Transformer Blocks（ViT: drop 用於 attn、proj、mlp）
             stage_blocks = nn.ModuleList([
-                TransformerBlock(dim=embed_dims[i]) for _ in range(depths[i])
+                TransformerBlock(dim=embed_dims[i], drop=drop_rate) for _ in range(depths[i])
             ])
             self.stages.append(stage_blocks)
             
             # C. 建立 Patch Merging (除了最後一個 Stage 以外都要 Merge)
             if i < num_stages - 1:
-                m = FlexiblePatchMerging(dim=embed_dims[i], m_h=2, m_w=2)
+                m_h, m_w = merge_sizes[i]
+                m = FlexiblePatchMerging(dim=embed_dims[i], m_h=m_h, m_w=m_w)
                 self.merges.append(m)
                 # 更新下一個 Stage 的解析度
-                h, w = self.get_next_resolution(h, w, 2, 2)
+                h, w = self.get_next_resolution(h, w, m_h, m_w)
             else:
                 self.merges.append(nn.Identity()) # 最後一層不 Merge
         
-        # 最後的分類頭
+        # 最後的分類頭（ViT: dropout 在 head 前）
         self.norm_final = nn.LayerNorm(embed_dims[-1])
+        self.head_drop = nn.Dropout(drop_rate)
         self.head = nn.Linear(embed_dims[-1], num_classes)
 
     @staticmethod # 設定為靜態方法，不需要實例化也能用
@@ -243,7 +264,9 @@ class MergingViT(nn.Module):
                 x, H, W = self.merges[i](x, H, W)
                 
         x = x.mean(dim=1)
-        return self.head(self.norm_final(x))
+        x = self.norm_final(x)
+        x = self.head_drop(x)
+        return self.head(x)
 
 # if __name__ == "__main__":
 #     # 建立模型實例 (這裡可以自由調整 depths 和 embed_dims)
