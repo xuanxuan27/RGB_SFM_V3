@@ -1450,6 +1450,6 @@ if __name__ == "__main__":
         inference_seed=42,
         model_args=model_args,  # 從 config 傳入，含 merge_size 等
         data_root=str(Path(cfg.config["root"]) / "data"),
-        mode="head",
+        mode="token",
         heads=None,
     )
