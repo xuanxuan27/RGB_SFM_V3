@@ -636,20 +636,37 @@ class ViTAnalyzer:
 
     def sample_random_images(self, m, seed=None):
         """
-        從 dataloader 隨機取 m 張圖片。
+        從整個 dataloader 均勻隨機取 m 張圖片（不依原始順序）。
         
         Returns:
             images: [m, 3, H_img, W_img]
         """
-        all_imgs = []
-        for imgs, _ in self.dataloader:
-            all_imgs.append(imgs.cpu())
-            if sum(f.shape[0] for f in all_imgs) >= m:
-                break
-        images = torch.cat(all_imgs, dim=0)
+        if m is None or m <= 0:
+            return torch.empty((0, 3, self.img_size, self.img_size))
+
         rng = np.random.default_rng(seed)
-        indices = rng.choice(images.shape[0], min(m, images.shape[0]), replace=False)
-        return images[indices]
+        sampled = []  # reservoir
+        seen = 0
+
+        for imgs, _ in self.dataloader:
+            imgs_cpu = imgs.cpu()
+            for i in range(imgs_cpu.shape[0]):
+                img = imgs_cpu[i]
+                seen += 1
+                if len(sampled) < m:
+                    sampled.append(img)
+                else:
+                    j = int(rng.integers(0, seen))
+                    if j < m:
+                        sampled[j] = img
+
+        if len(sampled) == 0:
+            return torch.empty((0, 3, self.img_size, self.img_size))
+
+        # 再打散一次輸出順序，避免看起來像原始資料順序
+        perm = rng.permutation(len(sampled))
+        images = torch.stack(sampled, dim=0)
+        return images[perm]
 
     def extract_features_for_images(self, images, stage_idx, block_idx):
         """
@@ -981,6 +998,7 @@ class ViTAnalyzer:
         positions=None, save_dir=None,
         m_inference=None, inference_seed=42,
         clusters_per_fig=10, n_clusters_per_stage=None,
+        save_cluster_representatives=True,
         mode="token", heads=None
     ):
         """
@@ -994,6 +1012,7 @@ class ViTAnalyzer:
             inference_seed: 隨機取圖的 seed
             clusters_per_fig: 每張圖顯示幾個 cluster，n_clusters 大時可拆圖
             n_clusters_per_stage: dict[stage_idx -> n_clusters]，若提供則依 stage 使用不同 cluster 數
+            save_cluster_representatives: 是否儲存每個 stage/block/position 的 cluster 代表圖
             mode: "token"（舊流程）或 "head"（per-head 分析）
             heads: mode="head" 時可指定要分析的 head 索引列表，None 表示全部 head
         """
@@ -1037,15 +1056,18 @@ class ViTAnalyzer:
                     k_nearest=k_nearest
                 )
 
-                positions_to_save = list(kmeans_dict.keys())
-                print(f"  儲存 {len(positions_to_save)} 個位置的代表圖...")
-                self.visualize_position_clusters(
-                    representatives, (H, W), nc, k_nearest,
-                    positions_to_show=positions_to_save,
-                    save_path=stage_dir / "repr",
-                    show=False,
-                    clusters_per_fig=clusters_per_fig
-                )
+                if save_cluster_representatives:
+                    positions_to_save = list(kmeans_dict.keys())
+                    print(f"  儲存 {len(positions_to_save)} 個位置的代表圖...")
+                    self.visualize_position_clusters(
+                        representatives, (H, W), nc, k_nearest,
+                        positions_to_show=positions_to_save,
+                        save_path=stage_dir / "repr",
+                        show=False,
+                        clusters_per_fig=clusters_per_fig
+                    )
+                else:
+                    print("  略過 stage/block 的 cluster 代表圖儲存（save_cluster_representatives=False）")
 
                 all_results[(stage_idx, block_idx)] = {
                     'features': features,
@@ -1165,7 +1187,8 @@ class ViTAnalyzer:
         隨機取 m 張圖，對每個 (stage, block) 推論 cluster 指派並存檔。
         使用單次 forward 取得所有 checkpoint 特徵，避免重複計算。
         儲存: inference/img{i}_original.png, inference/img{i}_s{s}_b{b}.png
-              inference/img{i}_s{s}_b{b}_repr_part{p}.png (每個位置對應 cluster 的代表圖)
+              inference/img{i}_s{s}_b{b}_repr_pos{pos}_cluster{c}.png
+              (每個位置對應 cluster 的代表圖，1 個 pos 存 1 張)
         """
         inference_dir = save_dir / "inference"
         inference_dir.mkdir(parents=True, exist_ok=True)
@@ -1207,55 +1230,46 @@ class ViTAnalyzer:
                 )
                 self._save_inference_repr(
                     sample_imgs[img_idx], labels_single, representatives,
-                    k_nearest, H, W, inference_dir, img_idx, stage_idx, block_idx,
-                    positions_per_fig=14
+                    k_nearest, H, W, inference_dir, img_idx, stage_idx, block_idx
                 )
             print(f"    已存 img{img_idx} 的原始圖、cluster 指派圖與代表圖")
 
     def _save_inference_repr(
         self, img, labels_single, representatives, k_nearest,
-        H, W, inference_dir, img_idx, stage_idx, block_idx,
-        positions_per_fig=14
+        H, W, inference_dir, img_idx, stage_idx, block_idx
     ):
         """
-        對每個 position 顯示其被分到的 cluster 的代表圖，每張圖最多 positions_per_fig 個 pos。
-        格式：每行 = Pos X → Cluster Y | 原圖該 pos 的 patch | k 張 cluster 代表 patch。
+        對每個 position 顯示其被分到的 cluster 的代表圖，並各自單獨存檔。
+        格式：Pos X → Cluster Y | 原圖該 pos 的 patch | k 張 cluster 代表 patch。
         """
         patch_h = self.img_size // H
         patch_w = self.img_size // W
         n_cols = 1 + 1 + k_nearest  # 標籤 + 原圖 patch + 代表 patch
         positions = sorted(labels_single.keys())
-        n_parts = (len(positions) + positions_per_fig - 1) // positions_per_fig
-        
-        for part_idx in range(n_parts):
-            start = part_idx * positions_per_fig
-            end = min(start + positions_per_fig, len(positions))
-            pos_subset = positions[start:end]
-            
-            n_rows = len(pos_subset)
-            fig, axes = plt.subplots(n_rows, n_cols, figsize=(2 * n_cols, n_rows * 1.2))
-            if n_rows == 1:
-                axes = axes.reshape(1, -1)
-            
-            for row, pos in enumerate(pos_subset):
-                cluster = labels_single[pos]
-                axes[row, 0].text(
-                    0.5, 0.5, f'Pos {pos}\n→ Cluster {cluster}',
-                    ha='center', va='center', fontsize=10
-                )
-                axes[row, 0].axis('off')
-                orig_patch = self.get_patch_from_image(img, pos, H, W, patch_h, patch_w)
-                axes[row, 1].imshow(orig_patch)
-                axes[row, 1].set_title('Input', fontsize=8)
-                axes[row, 1].axis('off')
-                for i in range(k_nearest):
-                    if (pos, cluster) in representatives and i < len(representatives[(pos, cluster)]):
-                        axes[row, 2 + i].imshow(representatives[(pos, cluster)][i])
-                    axes[row, 2 + i].axis('off')
-            
-            plt.suptitle(f'img{img_idx} s{stage_idx}_b{block_idx} repr (pos {pos_subset[0]}~{pos_subset[-1]})')
+
+        for pos in positions:
+            cluster = labels_single[pos]
+            fig, axes = plt.subplots(1, n_cols, figsize=(2 * n_cols, 2.2))
+            if n_cols == 1:
+                axes = np.array([axes])
+
+            axes[0].text(
+                0.5, 0.5, f'Pos {pos}\n→ Cluster {cluster}',
+                ha='center', va='center', fontsize=10
+            )
+            axes[0].axis('off')
+            orig_patch = self.get_patch_from_image(img, pos, H, W, patch_h, patch_w)
+            axes[1].imshow(orig_patch)
+            axes[1].set_title('Input', fontsize=8)
+            axes[1].axis('off')
+            for i in range(k_nearest):
+                if (pos, cluster) in representatives and i < len(representatives[(pos, cluster)]):
+                    axes[2 + i].imshow(representatives[(pos, cluster)][i])
+                axes[2 + i].axis('off')
+
+            plt.suptitle(f'img{img_idx} s{stage_idx}_b{block_idx} repr pos{pos} cluster{cluster}')
             plt.tight_layout()
-            save_path = inference_dir / f"img{img_idx}_s{stage_idx}_b{block_idx}_repr_part{part_idx}.png"
+            save_path = inference_dir / f"img{img_idx}_s{stage_idx}_b{block_idx}_repr_pos{pos}_cluster{cluster}.png"
             plt.savefig(save_path, dpi=150)
             plt.close(fig)
 
@@ -1334,7 +1348,8 @@ def run_colored_mnist_analysis_all(
     max_samples=None, n_clusters=10, k_nearest=5, positions=None, save_dir=None,
     m_inference=None, inference_seed=42, clusters_per_fig=10,
     n_clusters_per_stage=None, model_args=None, data_root=None,
-    mode="token", heads=None
+    save_cluster_representatives=True,
+    mode="token", heads=None, analysis_batch_size=32
 ):
     """
     對每個 stage、每個 block、每個 position 存代表圖。
@@ -1353,7 +1368,7 @@ def run_colored_mnist_analysis_all(
     
     _root = data_root if data_root is not None else str(Path(__file__).resolve().parent.parent / 'data')
     train_loader, _ = get_dataloader(
-        dataset=dataset, root=_root, batch_size=32,
+        dataset=dataset, root=_root, batch_size=analysis_batch_size,
         input_size=(img_size, img_size)
     )
     
@@ -1410,6 +1425,7 @@ def run_colored_mnist_analysis_all(
         inference_seed=inference_seed,
         clusters_per_fig=clusters_per_fig,
         n_clusters_per_stage=n_clusters_per_stage,
+        save_cluster_representatives=save_cluster_representatives,
         mode=mode,
         heads=heads
     )
@@ -1443,13 +1459,15 @@ if __name__ == "__main__":
         max_samples=None,  # 可設 500 加速
         n_clusters_per_stage=n_clusters_per_stage,
         k_nearest=4,
-        clusters_per_fig=10,  # 每 10 個 cluster 一張圖
+        clusters_per_fig=1,  # 每 10 個 cluster 一張圖
         positions=None,  # None=全部位置；可傳 [0,1,105] 等子集加速
-        save_dir='plots/kmeans_all_stages_blocks_head/',   # 預設 plots/kmeans_all_stages_blocks/
+        save_dir='plots/kmeans/Caltech101/',   # 預設 plots/kmeans_all_stages_blocks/
         m_inference=10,   # 隨機取 m 張圖推論 cluster 指派並存檔
         inference_seed=42,
+        save_cluster_representatives=False,  # 只存 inference 圖，不存每個 cluster 代表圖
         model_args=model_args,  # 從 config 傳入，含 merge_size 等
         data_root=str(Path(cfg.config["root"]) / "data"),
         mode="token",
         heads=None,
+        analysis_batch_size=cfg.config.get("batch_size", 4),
     )

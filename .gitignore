@@ -37,3 +37,5 @@ vit_analysis_output/
 mergingViT_plot_tool/plots/
 plots/
 mergingViT_plot_tool/plot_head_analysis/
+
+Caltech101_inference.tar.gz
