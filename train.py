@@ -25,6 +25,8 @@ def train(train_dataloader: DataLoader, valid_dataloader: DataLoader, model: nn.
     best_valid_acc = 0
     best_train_acc = 0
     best_valid_loss =  float('inf')
+    cur_train_loss = 0.0
+    cur_train_acc = 0.0
     count = 0
     patience = config['patience']
     # ???????
@@ -39,116 +41,139 @@ def train(train_dataloader: DataLoader, valid_dataloader: DataLoader, model: nn.
         use_gray = mode in ['gray', 'both']
         rgb_layers, gray_layers = get_basic_target_layers(model, use_gray=use_gray)
 
+    # with torch.autograd.set_detect_anomaly(True):
+    for e in range(epoch):
+        print(f"------------------------------EPOCH {e}------------------------------")
+        model.train()
+        progress = tqdm(enumerate(train_dataloader), desc="Loss: ", total=len(train_dataloader))
+        losses = 0
+        correct = 0
+        size = 0
+        # X, y = next(iter(train_dataloader))
+        for batch, (X, y) in progress:
+            X = X.to(device); y= y.to(device)
+            if use_preprocessed_image:
+                X = preprocess_retinal_tensor_batch(X, final_size=config['input_shape'])
 
-    with torch.autograd.set_detect_anomaly(True):
-        for e in range(epoch):
-            print(f"------------------------------EPOCH {e}------------------------------")
-            model.train()
-            progress = tqdm(enumerate(train_dataloader), desc="Loss: ", total=len(train_dataloader))
-            losses = 0
-            correct = 0
-            size = 0
-            X, y = next(iter(train_dataloader))
-            for batch, (X, y) in progress:
-                X = X.to(device); y= y.to(device)
-                # ???????
-                if use_preprocessed_image:
-                    X = preprocess_retinal_tensor_batch(X, final_size=config['input_shape'])
+            optimizer.zero_grad()
 
-                pred = model(X)
-                # ?????? metric-based loss
-                if use_metric_based_loss:
-                    loss = training_loss_fn(pred, y, model, rgb_layers, gray_layers, X)
-                else:
-                    loss = eval_loss_fn(pred, y)
+            pred = model(X)
+            if use_metric_based_loss:
+                loss = training_loss_fn(pred, y, model, rgb_layers, gray_layers, X)
+            else:
+                loss = eval_loss_fn(pred, y)
 
-                # ????
-                loss.backward()
-                # ??????
-                optimizer.step()
-                    
-                # ????
-                optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
                 
-                losses += loss.detach().item()
-                size += len(X)
+            # optimizer.zero_grad() 移動到前面
+            
+            losses += loss.detach().item()
+            size += len(X)
 
-                if y.dim() == 1:
-                    targets = y
-                else:
-                    targets = y.argmax(1)
+            if y.dim() == 1:
+                targets = y
+            else:
+                targets = y.argmax(1)
 
-                correct += (pred.argmax(1) == targets).type(torch.float).sum().item()
+            correct += (pred.argmax(1) == targets).type(torch.float).sum().item()
 
-                train_loss = losses / (batch + 1)
-                train_acc = correct / size
-                progress.set_description("Loss: {:.7f}, Accuracy: {:.7f}".format(train_loss, train_acc))
+            train_loss = losses / (batch + 1)
+            train_acc = correct / size
+            progress.set_description("Loss: {:.7f}, Accuracy: {:.7f}".format(train_loss, train_acc))
 
-            valid_acc, valid_loss, _ = eval(valid_dataloader, model, eval_loss_fn, False, device = device, use_preprocessed_image=use_preprocessed_image)
-            print(f"Test Loss: {valid_loss}, Test Accuracy: {valid_acc}")
+        valid_acc, valid_loss, _ = eval(valid_dataloader, model, eval_loss_fn, False, device = device, use_preprocessed_image=use_preprocessed_image)
+        print(f"Test Loss: {valid_loss}, Test Accuracy: {valid_acc}")
 
 
 
-            if scheduler:
-                scheduler.step(valid_loss)
+        if scheduler:
+            # scheduler.step(valid_loss) # ReduceLROnPlateau
+            scheduler.step() # CosineAnnealingLR
 
-            metrics = {
-                "train/loss": train_loss,
-                "train/epoch": e,
-                "train/accuracy": train_acc,
-                "train/learnrate": optimizer.param_groups[0]['lr'],
-                "valid/loss": valid_loss,
-                "valid/accuracy": valid_acc,
+        metrics = {
+            "train/loss": train_loss,
+            "train/epoch": e,
+            "train/accuracy": train_acc,
+            "train/learnrate": optimizer.param_groups[0]['lr'],
+            "valid/loss": valid_loss,
+            "valid/accuracy": valid_acc,
+        }
+        wandb.log(metrics, step=e)
+
+        # # early stopping
+        # if config['early_stop']:
+        #     if valid_acc < best_valid_acc:
+        #         count += 1
+        #         if count >= patience:
+        #             break
+
+        # # update model methods
+        # if valid_acc > best_valid_acc:
+        #     best_valid_loss = valid_loss
+        #     best_valid_acc = valid_acc
+        # # if valid_loss < best_valid_loss:
+        # #     best_valid_acc = valid_acc
+        # if train_acc >= best_train_acc:
+        #     best_train_acc = train_acc
+
+        #     cur_train_loss = train_loss
+        #     cur_train_acc = train_acc
+
+        #     count = 0
+
+        #     del checkpoint
+        #     checkpoint = {}
+        #     print(f'best epoch: {e}')
+        #     checkpoint['model_weights'] = model.state_dict()
+        #     checkpoint['optimizer'] = optimizer.state_dict()
+        #     checkpoint['scheduler'] = scheduler.state_dict()
+        #     checkpoint['train_loss'] = train_loss
+        #     checkpoint['train_acc'] = train_acc
+        #     checkpoint['valid_loss'] = valid_loss
+        #     checkpoint['valid_acc'] = valid_acc
+        #     checkpoint['best_epoch'] = e
+
+        #     save_path = f'{config["save_dir"]}/best_epoch.pth'
+        #     try:
+        #         torch.save(checkpoint, save_path)
+        #     except (OSError, RuntimeError) as err:
+        #         if getattr(err, 'errno', None) == 28 or 'space' in str(err).lower():
+        #             print("Warning: Disk full, skip saving checkpoint.")
+        #         else:
+        #             raise
+
+        # early stopping + checkpoint（只看 valid_acc）
+        if valid_acc > best_valid_acc:
+            best_valid_acc = valid_acc
+            best_valid_loss = valid_loss
+            cur_train_loss = train_loss
+            cur_train_acc = train_acc     
+            count = 0
+            checkpoint = {
+                'model_weights': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'train_loss': train_loss,
+                'train_acc': train_acc,
+                'valid_loss': valid_loss,
+                'valid_acc': valid_acc,
+                'best_epoch': e,
             }
-            wandb.log(metrics, step=e)
+            torch.save(checkpoint, f'{config["save_dir"]}/best_epoch.pth')
+            print(f"✓ Best epoch: {e}, val_acc: {valid_acc:.4f}")
+        else:
+            count += 1
+            if config['early_stop'] and count >= patience:
+                print(f"Early stopping at epoch {e}")
+                break
 
-            #early stopping
-            if config['early_stop']:
-                if valid_acc < best_valid_acc:
-                    count += 1
-                    if count >= patience:
-                        break
-
-            # update model methods
-            if valid_acc > best_valid_acc:
-                best_valid_loss = valid_loss
-                best_valid_acc = valid_acc
-            # if valid_loss < best_valid_loss:
-            #     best_valid_acc = valid_acc
-            if train_acc >= best_train_acc:
-                best_train_acc = train_acc
-
-                cur_train_loss = train_loss
-                cur_train_acc = train_acc
-
-                count = 0
-
-                del checkpoint
-                checkpoint = {}
-                print(f'best epoch: {e}')
-                checkpoint['model_weights'] = model.state_dict()
-                checkpoint['optimizer'] = optimizer.state_dict()
-                checkpoint['scheduler'] = scheduler.state_dict()
-                checkpoint['train_loss'] = train_loss
-                checkpoint['train_acc'] = train_acc
-                checkpoint['valid_loss'] = valid_loss
-                checkpoint['valid_acc'] = valid_acc
-                checkpoint['best_epoch'] = e
-
-                save_path = f'{config["save_dir"]}/best_epoch.pth'
-                try:
-                    torch.save(checkpoint, save_path)
-                except (OSError, RuntimeError) as err:
-                    if getattr(err, 'errno', None) == 28 or 'space' in str(err).lower():
-                        print("Warning: Disk full, skip saving checkpoint.")
-                    else:
-                        raise
-            if e == 200 and checkpoint:
-                try:
-                    torch.save(checkpoint, f'{config["save_dir"]}/epochs{e}.pth')
-                except (OSError, RuntimeError) as err:
-                    if getattr(err, 'errno', None) == 28 or 'space' in str(err).lower():
-                        print("Warning: Disk full, skip epochs save.")
+        if e == 200 and checkpoint:
+            try:
+                torch.save(checkpoint, f'{config["save_dir"]}/epochs{e}.pth')
+            except (OSError, RuntimeError) as err:
+                if getattr(err, 'errno', None) == 28 or 'space' in str(err).lower():
+                    print("Warning: Disk full, skip epochs save.")
 
                 
     # print(model)
@@ -248,6 +273,7 @@ model = model.to(config['device'])
 print(model)
 # summary(model, input_size = (config['model']['args']['in_channels'], *config['input_shape']))
 
+##############################################################
 
 eval_loss_fn = get_loss_function(config['loss_fn'])
 training_loss_fn = get_loss_function(config['training_loss_fn'])

@@ -60,25 +60,21 @@ def get_dataloader(dataset, root: str = '.', batch_size=32, input_size: tuple = 
         if dataset == 'Caltech101':
             # Train：RandomResizedCrop + Flip +（可選）ColorJitter
             train_transform = transforms.Compose([
+                transforms.Lambda(lambda img: img.convert('RGB')),  # ← 移到最前面
                 transforms.RandomResizedCrop(input_size[0], scale=(0.6, 1.0)),
-                transforms.Lambda(lambda img: img.convert('RGB')),
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(
-                    brightness=0.2,
-                    contrast=0.2,
-                    saturation=0.2,
-                    hue=0.0,
-                ),
+                transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
                 transforms.ToTensor(),
-                transforms.ConvertImageDtype(torch.float),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),  # ← 加上
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.25), ratio=(0.3, 3.3), value='random'),
             ])
 
-            # Test/Val：只做 deterministic 的 Resize + 轉 RGB
             test_transform = transforms.Compose([
-                transforms.Resize([*input_size]),
-                transforms.Lambda(lambda img: img.convert('RGB')),
+                transforms.Lambda(lambda img: img.convert('RGB')),  # ← 移到最前面
+                transforms.Resize(256),
+                transforms.CenterCrop(input_size[0]),               # ← 比直接 Resize 好
                 transforms.ToTensor(),
-                transforms.ConvertImageDtype(torch.float),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),  # ← 加上
             ])
         else:
             common_transforms = [
@@ -95,7 +91,7 @@ def get_dataloader(dataset, root: str = '.', batch_size=32, input_size: tuple = 
         test_dataset = dataset_classes[dataset](root, train = False, transform = test_transform)
 
         train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
+        test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
         return train_dataloader, test_dataloader
     else:

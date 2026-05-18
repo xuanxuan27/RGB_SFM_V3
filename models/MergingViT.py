@@ -7,6 +7,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from timm.layers import DropPath 
 
 # --- 積木層 ---
 class FlexiblePatchMerging(nn.Module):
@@ -165,7 +166,7 @@ class Mlp(nn.Module):
 
 # --- 單元層 ---
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads=8, mlp_ratio=4., qkv_bias=False, drop=0.):
+    def __init__(self, dim, num_heads=8, mlp_ratio=4., qkv_bias=False, drop=0., drop_path=0.):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         # ViT: attn_drop 在 attention weights 後，proj_drop 在 output projection 後
@@ -174,16 +175,17 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         # mlp_ratio 通常設為 4，這就是隱藏層變胖 4 倍的地方；ViT: MLP 內兩處 dropout
         self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), drop=drop)
-
+        # drop_path > 0 才建立，否則用 Identity（不做任何事）
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
     def forward(self, x):
         # Pre-norm 結構：先過 Norm 再做 Attention/MLP，最後加回殘差
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 class MergingViT(nn.Module):
     def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=10, 
-                 embed_dims=[64, 128, 256, 512], depths=[1, 1, 1, 1], merge_size=2, drop_rate=0.1):
+                 embed_dims=[64, 128, 256, 512], depths=[1, 1, 1, 1], merge_size=2, drop_rate=0.1, drop_path_rate=0.1):
         super().__init__()
         
         # 1. 初始 Patch Embedding (通常第一層切較大，如 4x4)
@@ -215,14 +217,21 @@ class MergingViT(nn.Module):
         else:
             merge_sizes = [(2, 2)] * num_merges
 
+        num_blocks_total = sum(depths)
+        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, num_blocks_total)]
+
+        block_idx = 0
+
         for i in range(num_stages):
             # A. 建立當前 Stage 的位置編碼
             self.pos_embeds.append(nn.Parameter(torch.zeros(1, h * w, embed_dims[i])))
             
             # B. 建立當前 Stage 的 Transformer Blocks（ViT: drop 用於 attn、proj、mlp）
             stage_blocks = nn.ModuleList([
-                TransformerBlock(dim=embed_dims[i], drop=drop_rate) for _ in range(depths[i])
+                TransformerBlock(dim=embed_dims[i], drop=drop_rate,
+                drop_path=dp_rates[block_idx + j]) for j in range(depths[i])
             ])
+            block_idx += depths[i]
             self.stages.append(stage_blocks)
             
             # C. 建立 Patch Merging (除了最後一個 Stage 以外都要 Merge)

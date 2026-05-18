@@ -4,6 +4,7 @@ Custom wrapper for Caltech-101 to fit the project's Dataset interface.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional, Callable, Tuple, Any
 
@@ -20,6 +21,9 @@ class Caltech101Dataset(Dataset):
     deterministically partition it by slicing the ordered sample list based on
     `train_ratio`. This keeps behaviour reproducible without relying on any
     extra metadata files.
+
+    Split 策略採用 per-class stratified split：每個類別各自按 train_ratio 切分，
+    確保 train/val 的類別分佈一致，避免小類別在 val set 幾乎沒有樣本的問題。
     """
 
     def __init__(
@@ -45,37 +49,32 @@ class Caltech101Dataset(Dataset):
             download=download,
         )
 
-        total = len(self.base_dataset)
-        # split_index = max(1, int(total * train_ratio))
-        # split_index = min(split_index, total - 1)
+        # --- Stratified split：每個類別各自切 train_ratio ---
+        # 先把每個類別的 index 分組
+        class_to_indices = defaultdict(list)
+        for idx in range(len(self.base_dataset)):
+            _, label = self.base_dataset[idx]
+            class_to_indices[label].append(idx)
 
-        # if self.train:
-        #     self.indices = range(0, split_index)
-        # else:
-        #     self.indices = range(split_index, total)
-
-        # self.classes = self.base_dataset.categories
-
-        # --- 修正開始 ---
-        # 1. 產生所有索引
-        all_indices = list(range(total))
-        
-        # 2. 使用固定種子打亂 (確保 train=True 和 train=False 亂掉的順序是一樣的)
+        # 固定種子，確保 train=True / train=False 結果一致
         g = torch.Generator()
         g.manual_seed(seed)
-        # 使用 torch.randperm 產生隨機順序
-        shuffled_indices = torch.randperm(total, generator=g).tolist()
-        
-        split_index = max(1, int(total * train_ratio))
-        split_index = min(split_index, total - 1)
 
-        if self.train:
-            # 取打亂後的前半段
-            self.indices = shuffled_indices[:split_index]
-        else:
-            # 取打亂後的後半段
-            self.indices = shuffled_indices[split_index:]
-        # --- 修正結束 ---
+        train_indices, val_indices = [], []
+        for label, idxs in sorted(class_to_indices.items()):
+            # 對這個類別的 indices 做 shuffle
+            perm = torch.randperm(len(idxs), generator=g).tolist()
+            shuffled = [idxs[i] for i in perm]
+
+            # 至少保留 1 筆在 train，1 筆在 val
+            split = max(1, int(len(idxs) * train_ratio))
+            split = min(split, len(idxs) - 1)
+
+            train_indices.extend(shuffled[:split])
+            val_indices.extend(shuffled[split:])
+
+        self.indices = train_indices if self.train else val_indices
+        # --- Stratified split 結束 ---
 
         self.classes = self.base_dataset.categories
 
@@ -95,4 +94,3 @@ class Caltech101Dataset(Dataset):
         target = torch.tensor(target, dtype=torch.long)
 
         return img, target
-

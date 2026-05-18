@@ -12,6 +12,8 @@ def get_loss_function(loss_name: str, weight=None, reduction='mean'):
         return nn.MSELoss()
     elif loss_name == 'MetricBaseLoss':
         return MetricBaseLoss()
+    elif loss_name == 'LabelSmoothingCrossEntropy':
+        return nn.CrossEntropyLoss(label_smoothing=0.1)
     # 可以根據需要添加更多損失函數
     else:
         raise ValueError(f"Unknown loss function: {loss_name}")
