@@ -1,0 +1,11 @@
+---
+description: Use the SFM conda environment for project Python commands
+alwaysApply: true
+---
+
+# Python Environment
+
+- Run Python commands for this project through the `SFM` conda environment.
+- Prefer `conda run -n SFM python ...` for scripts, smoke tests, and one-off checks.
+- Prefer `conda run -n SFM python -m py_compile ...` when checking Python syntax.
+- Do not use the system `python` or `python3` for dependency-sensitive checks unless the user explicitly asks.

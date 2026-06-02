@@ -29,6 +29,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import normalize
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 from models.MergingViT import MergingViT
 
 
@@ -210,12 +211,712 @@ def cluster_vit_patches(features, n_clusters=8, random_state=42, return_grid_sha
     return labels
 
 
+_MERGING_VIT_ALLOWED_ARGS = {
+    "img_size",
+    "patch_size",
+    "in_chans",
+    "num_classes",
+    "embed_dims",
+    "depths",
+    "merge_size",
+    "drop_rate",
+    "drop_path_rate",
+}
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def _validate_mergingvit_model_args(model_args=None, model_name=None):
+    """避免把其他模型（例如 Swin_tiny）的 config 傳進 MergingViT。"""
+    if model_name is not None and model_name != "MergingViT":
+        raise ValueError(
+            f"KMeans/GradCAM trace 目前只支援 MergingViT，但 config model name 是 {model_name!r}。"
+        )
+    if model_args is None:
+        return
+
+    unexpected = sorted(set(model_args) - _MERGING_VIT_ALLOWED_ARGS)
+    if unexpected:
+        raise ValueError(
+            "model_args 含有 MergingViT 不支援的參數 "
+            f"{unexpected}；請確認 config['model']['name'] 是 'MergingViT'，"
+            "或手動傳入 MergingViT 的 model_args。"
+        )
+
+
 class ViTAnalyzer:
-    def __init__(self, model, dataloader, img_size=28, device='cuda'):
+    def __init__(
+        self, model, dataloader, img_size=28, device='cuda',
+        display_mean=None, display_std=None
+    ):
         self.model = model.to(device).eval()
         self.dataloader = dataloader
         self.device = device
         self.img_size = img_size
+        self.display_mean = display_mean
+        self.display_std = display_std
+        self.stage_resolutions = self._build_stage_resolutions()
+
+    def _build_stage_resolutions(self):
+        """
+        建立每個 stage 的原始解析度與 merge 時的 padded 解析度。
+        這只依賴模型架構，可重複用於每張 inference 圖。
+        """
+        H, W = self.model.patch_embed.grid_h, self.model.patch_embed.grid_w
+        resolutions = []
+
+        for stage_idx in range(len(self.model.stages)):
+            entry = {
+                "stage": int(stage_idx),
+                "H": int(H),
+                "W": int(W),
+                "num_tokens": int(H * W),
+                "has_merge": not isinstance(self.model.merges[stage_idx], nn.Identity),
+            }
+
+            if entry["has_merge"]:
+                merge = self.model.merges[stage_idx]
+                m_h, m_w = int(merge.m_h), int(merge.m_w)
+                pad_h = (m_h - H % m_h) % m_h
+                pad_w = (m_w - W % m_w) % m_w
+                padded_H, padded_W = H + pad_h, W + pad_w
+                next_H, next_W = padded_H // m_h, padded_W // m_w
+                entry.update({
+                    "m_h": m_h,
+                    "m_w": m_w,
+                    "pad_h": int(pad_h),
+                    "pad_w": int(pad_w),
+                    "padded_H": int(padded_H),
+                    "padded_W": int(padded_W),
+                    "next_H": int(next_H),
+                    "next_W": int(next_W),
+                })
+                H, W = next_H, next_W
+            else:
+                entry.update({
+                    "m_h": None,
+                    "m_w": None,
+                    "pad_h": 0,
+                    "pad_w": 0,
+                    "padded_H": int(H),
+                    "padded_W": int(W),
+                    "next_H": None,
+                    "next_W": None,
+                })
+
+            resolutions.append(entry)
+
+        return resolutions
+
+    def forward_for_gradcam(self, img, target_class=None):
+        """
+        獨立 GradCAM forward：保留最後 stage 最後 block 後、GAP 前的 token 梯度。
+        不複用 get_all_features_at_checkpoints，避免 clone/retain_grad 節點混淆。
+        """
+        self.model.eval()
+        self.model.zero_grad(set_to_none=True)
+
+        x = img.to(self.device)
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+        if x.shape[0] != 1:
+            raise ValueError("forward_for_gradcam 目前一次只處理單張圖。")
+
+        with torch.enable_grad():
+            x = self.model.patch_embed(x)
+            H, W = self.model.patch_embed.grid_h, self.model.patch_embed.grid_w
+            activation = None
+            last_stage_idx = len(self.model.stages) - 1
+            last_block_idx = len(self.model.stages[last_stage_idx]) - 1
+
+            for stage_idx in range(len(self.model.stages)):
+                x = x + self.model.pos_embeds[stage_idx]
+                for block_idx, blk in enumerate(self.model.stages[stage_idx]):
+                    x = blk(x)
+                    if stage_idx == last_stage_idx and block_idx == last_block_idx:
+                        activation = x
+                        activation.retain_grad()
+
+                if not isinstance(self.model.merges[stage_idx], nn.Identity):
+                    x, H, W = self.model.merges[stage_idx](x, H, W)
+
+            if activation is None:
+                raise RuntimeError("無法取得最後 stage 的 token activation。")
+
+            pooled = activation.mean(dim=1)
+            pooled = self.model.norm_final(pooled)
+            pooled = self.model.head_drop(pooled)
+            logits = self.model.head(pooled)
+            if target_class is None:
+                target_class = int(logits.argmax(dim=1).item())
+            score = logits[0, int(target_class)]
+            score.backward()
+
+        grad = activation.grad
+        if grad is None:
+            raise RuntimeError("最後 stage activation 沒有 gradient；請確認 retain_grad 在 backward 前呼叫。")
+
+        cam = (grad * activation).sum(dim=-1).clamp(min=0)
+        cam = cam[0].detach().cpu()
+        cam_min, cam_max = cam.min(), cam.max()
+        if float(cam_max - cam_min) > 1e-12:
+            cam = (cam - cam_min) / (cam_max - cam_min)
+        else:
+            cam = torch.zeros_like(cam)
+
+        self.model.zero_grad(set_to_none=True)
+        return logits.detach().cpu(), int(target_class), cam, int(H), int(W)
+
+    def compute_gradcam_topk(self, img, top_k=5, target_class=None):
+        """回傳最後 stage CAM map 與 top-k token positions。"""
+        logits, target_class, cam, H, W = self.forward_for_gradcam(
+            img, target_class=target_class
+        )
+        n_tokens = int(cam.numel())
+        k = min(int(top_k), n_tokens)
+        order = torch.argsort(cam, descending=True)[:k].tolist()
+        top_positions = []
+        for rank, pos in enumerate(order, start=1):
+            pos = int(pos)
+            top_positions.append({
+                "rank": int(rank),
+                "pos": pos,
+                "row": int(pos // W),
+                "col": int(pos % W),
+                "score": float(cam[pos].item()),
+            })
+
+        return {
+            "target_class": int(target_class),
+            "pred_class": int(logits.argmax(dim=1).item()),
+            "logits": logits[0].tolist(),
+            "H": int(H),
+            "W": int(W),
+            "cam": cam.view(H, W).numpy(),
+            "top_positions": top_positions,
+        }
+
+    def _children_for_parent(self, stage_from, parent_pos):
+        """取得 stage_from+1 的 parent token 在 stage_from 的來源 positions。"""
+        info = self.stage_resolutions[stage_from]
+        if not info["has_merge"]:
+            return []
+
+        parent_pos = int(parent_pos)
+        parent_row = parent_pos // info["next_W"]
+        parent_col = parent_pos % info["next_W"]
+        children = []
+
+        for dh in range(info["m_h"]):
+            for dw in range(info["m_w"]):
+                row = parent_row * info["m_h"] + dh
+                col = parent_col * info["m_w"] + dw
+                is_pad = row >= info["H"] or col >= info["W"]
+                pos = None if is_pad else int(row * info["W"] + col)
+                children.append({
+                    "stage": int(stage_from),
+                    "pos": pos,
+                    "row": int(row),
+                    "col": int(col),
+                    "is_pad": bool(is_pad),
+                })
+
+        return children
+
+    def trace_last_stage_positions(self, last_stage_positions):
+        """
+        將最後 stage 的 positions 依 padded merge mapping 回溯到 stage 2~0。
+        padding source 會保留，但不再繼續往更細 stage 展開。
+        """
+        last_stage_idx = len(self.stage_resolutions) - 1
+        traces = {}
+
+        for item in last_stage_positions:
+            last_pos = int(item["pos"] if isinstance(item, dict) else item)
+            parents = [{
+                "stage": int(last_stage_idx),
+                "pos": last_pos,
+                "row": int(last_pos // self.stage_resolutions[last_stage_idx]["W"]),
+                "col": int(last_pos % self.stage_resolutions[last_stage_idx]["W"]),
+                "is_pad": False,
+            }]
+            per_stage = {}
+
+            for stage_from in range(last_stage_idx - 1, -1, -1):
+                children = []
+                for parent in parents:
+                    if parent.get("is_pad") or parent.get("pos") is None:
+                        continue
+                    children.extend(
+                        self._children_for_parent(stage_from, parent["pos"])
+                    )
+                per_stage[int(stage_from)] = children
+                parents = [child for child in children if not child["is_pad"]]
+
+            traces[last_pos] = per_stage
+
+        return traces
+
+    def _resolve_trace_block_indices(self, stage_idx, trace_block="last"):
+        if trace_block == "last":
+            return [len(self.model.stages[stage_idx]) - 1]
+        if trace_block == "all":
+            return list(range(len(self.model.stages[stage_idx])))
+        if isinstance(trace_block, int):
+            block_idx = int(trace_block)
+            if block_idx < 0 or block_idx >= len(self.model.stages[stage_idx]):
+                raise ValueError(
+                    f"stage {stage_idx} 沒有 block {block_idx}，"
+                    f"有效範圍是 0~{len(self.model.stages[stage_idx]) - 1}"
+                )
+            return [block_idx]
+        raise ValueError(f"trace_block 必須是 'last'、'all' 或 int，目前收到 {trace_block!r}")
+
+    def _cluster_records_for_position(
+        self, labels_by_checkpoint, stage_idx, pos, trace_block="last"
+    ):
+        records = []
+        for block_idx in self._resolve_trace_block_indices(stage_idx, trace_block):
+            labels_single = labels_by_checkpoint.get((stage_idx, block_idx), {})
+            if pos in labels_single:
+                cluster = int(labels_single[pos])
+                missing = False
+            else:
+                cluster = None
+                missing = True
+            records.append({
+                "block": int(block_idx),
+                "cluster": cluster,
+                "missing_kmeans": bool(missing),
+            })
+        return records
+
+    def build_gradcam_trace_payload(
+        self, img_idx, gradcam_result, traces, labels_by_checkpoint,
+        trace_block="last"
+    ):
+        """組合單張圖的 GradCAM top-k、回溯來源與 cluster labels。"""
+        last_stage_idx = len(self.stage_resolutions) - 1
+        payload = {
+            "img_idx": int(img_idx),
+            "target_class": int(gradcam_result["target_class"]),
+            "pred_class": int(gradcam_result["pred_class"]),
+            "last_stage": int(last_stage_idx),
+            "last_stage_H": int(gradcam_result["H"]),
+            "last_stage_W": int(gradcam_result["W"]),
+            "trace_block": trace_block,
+            "cam": gradcam_result["cam"].tolist(),
+            "top_positions": [],
+        }
+
+        for top_item in gradcam_result["top_positions"]:
+            last_pos = int(top_item["pos"])
+            item_payload = {
+                **top_item,
+                "clusters": self._cluster_records_for_position(
+                    labels_by_checkpoint, last_stage_idx, last_pos, trace_block
+                ),
+                "sources_by_stage": {},
+            }
+
+            for stage_idx in range(last_stage_idx - 1, -1, -1):
+                source_items = []
+                for source in traces[last_pos].get(stage_idx, []):
+                    pos = source["pos"]
+                    source_payload = dict(source)
+                    if source["is_pad"] or pos is None:
+                        source_payload["clusters"] = []
+                    else:
+                        source_payload["clusters"] = self._cluster_records_for_position(
+                            labels_by_checkpoint, stage_idx, int(pos), trace_block
+                        )
+                    source_items.append(source_payload)
+                item_payload["sources_by_stage"][str(stage_idx)] = source_items
+
+            payload["top_positions"].append(item_payload)
+
+        return payload
+
+    def _save_gradcam_trace_visualization(self, gradcam_result, traces, save_path):
+        """儲存 CAM heatmap 與各 stage source mask，方便檢查 mapping。"""
+        last_stage_idx = len(self.stage_resolutions) - 1
+        n_cols = 1 + last_stage_idx
+        fig, axes = plt.subplots(1, n_cols, figsize=(3.2 * n_cols, 3.2))
+        if n_cols == 1:
+            axes = np.array([axes])
+
+        cam = gradcam_result["cam"]
+        axes[0].imshow(cam, cmap="hot")
+        axes[0].set_title("Last-stage GradCAM", fontsize=9)
+        for top_item in gradcam_result["top_positions"]:
+            axes[0].text(
+                top_item["col"], top_item["row"], str(top_item["rank"]),
+                color="cyan", ha="center", va="center", fontsize=8
+            )
+        axes[0].axis("off")
+
+        for ax_idx, stage_idx in enumerate(range(last_stage_idx - 1, -1, -1), start=1):
+            info = self.stage_resolutions[stage_idx]
+            mask = np.zeros((info["padded_H"], info["padded_W"]), dtype=np.float32)
+            for top_item in gradcam_result["top_positions"]:
+                last_pos = int(top_item["pos"])
+                for source in traces[last_pos].get(stage_idx, []):
+                    row, col = int(source["row"]), int(source["col"])
+                    if source["is_pad"]:
+                        mask[row, col] = -1.0
+                    else:
+                        mask[row, col] = max(mask[row, col], float(top_item["score"]))
+            axes[ax_idx].imshow(mask, cmap="viridis")
+            axes[ax_idx].set_title(f"Stage {stage_idx} sources", fontsize=9)
+            axes[ax_idx].axis("off")
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150)
+        plt.close(fig)
+
+    def _image_to_numpy(self, img):
+        img_np = img.detach().cpu().permute(1, 2, 0).numpy()
+        if self.display_mean is not None and self.display_std is not None:
+            mean = np.asarray(self.display_mean, dtype=np.float32).reshape(1, 1, 3)
+            std = np.asarray(self.display_std, dtype=np.float32).reshape(1, 1, 3)
+            img_np = img_np * std + mean
+        return np.clip(img_np, 0, 1)
+
+    def _effective_n_clusters(self, requested_n_clusters, n_samples, context="K-means"):
+        """KMeans 的 cluster 數不能大於樣本數；不足時自動降到可執行的上限。"""
+        requested_n_clusters = int(requested_n_clusters)
+        n_samples = int(n_samples)
+        if n_samples < 1:
+            raise ValueError(f"{context}: 至少需要 1 筆樣本才能做 K-means。")
+        if requested_n_clusters < 1:
+            raise ValueError(f"{context}: n_clusters 必須 >= 1，目前是 {requested_n_clusters}。")
+        if requested_n_clusters > n_samples:
+            print(
+                f"  警告: {context} 的 n_clusters={requested_n_clusters} "
+                f"大於樣本數 {n_samples}，自動改用 n_clusters={n_samples}。"
+            )
+            return n_samples
+        return requested_n_clusters
+
+    def _source_positions_at_stage(self, stage_idx, pos, target_stage=0):
+        """將指定 stage 的 token 展開到 target_stage 的真實 source positions。"""
+        if stage_idx == target_stage:
+            info = self.stage_resolutions[stage_idx]
+            pos = int(pos)
+            return [{
+                "stage": int(stage_idx),
+                "pos": pos,
+                "row": int(pos // info["W"]),
+                "col": int(pos % info["W"]),
+                "is_pad": False,
+            }]
+
+        sources = []
+        for child in self._children_for_parent(stage_idx - 1, pos):
+            if child["is_pad"] or child["pos"] is None:
+                continue
+            sources.extend(
+                self._source_positions_at_stage(
+                    child["stage"], child["pos"], target_stage=target_stage
+                )
+            )
+        return sources
+
+    def _stage_patch_bounds(self, stage_idx, pos):
+        """
+        回傳 stage token 在原圖上的 pixel bbox。
+        對 coarse stage 不用 img_size/stage_H 均分，而是用 stage0 source patch union。
+        """
+        stage0_sources = self._source_positions_at_stage(stage_idx, pos, target_stage=0)
+        if not stage0_sources:
+            return None
+
+        patch_h = int(self.model.patch_embed.patch_h)
+        patch_w = int(self.model.patch_embed.patch_w)
+        rows = [source["row"] for source in stage0_sources]
+        cols = [source["col"] for source in stage0_sources]
+        y1 = max(0, min(rows) * patch_h)
+        y2 = min(self.img_size, (max(rows) + 1) * patch_h)
+        x1 = max(0, min(cols) * patch_w)
+        x2 = min(self.img_size, (max(cols) + 1) * patch_w)
+        return int(y1), int(y2), int(x1), int(x2)
+
+    def _draw_stage_box(self, ax, stage_idx, pos, label, color="cyan", linewidth=2):
+        bounds = self._stage_patch_bounds(stage_idx, pos)
+        if bounds is None:
+            return
+        y1, y2, x1, x2 = bounds
+        rect = patches.Rectangle(
+            (x1, y1), x2 - x1, y2 - y1, fill=False,
+            edgecolor=color, linewidth=linewidth
+        )
+        ax.add_patch(rect)
+        ax.text(
+            x1 + (x2 - x1) / 2, y1 + (y2 - y1) / 2, label,
+            color=color, fontsize=8, ha="center", va="center",
+            bbox=dict(facecolor="black", alpha=0.45, edgecolor="none", pad=1)
+        )
+
+    def save_gradcam_topk_overview(self, img, gradcam_result, save_path):
+        """在原圖標出 GradCAM top-k patch，並附最後 stage CAM heatmap。"""
+        fig, axes = plt.subplots(1, 2, figsize=(9, 4.5))
+        img_np = self._image_to_numpy(img)
+        axes[0].imshow(img_np)
+        axes[0].set_title("Original with top-k patches", fontsize=10)
+        axes[0].axis("off")
+
+        H, W = int(gradcam_result["H"]), int(gradcam_result["W"])
+        last_stage_idx = len(self.stage_resolutions) - 1
+        for top_item in gradcam_result["top_positions"]:
+            self._draw_stage_box(
+                axes[0], last_stage_idx, top_item["pos"],
+                f"#{top_item['rank']}\npos{top_item['pos']}",
+            )
+
+        axes[1].imshow(gradcam_result["cam"], cmap="hot")
+        axes[1].set_title("Last-stage GradCAM", fontsize=10)
+        for top_item in gradcam_result["top_positions"]:
+            axes[1].text(
+                top_item["col"], top_item["row"], str(top_item["rank"]),
+                color="cyan", ha="center", va="center", fontsize=9,
+                bbox=dict(facecolor="black", alpha=0.45, edgecolor="none", pad=1)
+            )
+        axes[1].axis("off")
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=160)
+        plt.close(fig)
+
+    def save_gradcam_trace_summary(self, gradcam_result, traces, save_path):
+        """正式的 top-k 合併報告圖：last-stage top-k 與各 stage source masks。"""
+        self._save_gradcam_trace_visualization(gradcam_result, traces, save_path)
+
+    def _cluster_and_representatives_for_pos(
+        self, all_results, labels_by_checkpoint, stage_idx, pos,
+        trace_block="last", k_nearest=4
+    ):
+        block_indices = self._resolve_trace_block_indices(stage_idx, trace_block)
+        block_idx = block_indices[0]
+        labels_single = labels_by_checkpoint.get((stage_idx, block_idx), {})
+        cluster = labels_single.get(int(pos))
+        reps = []
+        if cluster is not None and (stage_idx, block_idx) in all_results:
+            representatives = all_results[(stage_idx, block_idx)]["representatives"]
+            reps = representatives.get((int(pos), int(cluster)), [])[:k_nearest]
+        return block_idx, cluster, reps
+
+    def _stage_patch(self, img, stage_idx, pos):
+        bounds = self._stage_patch_bounds(stage_idx, pos)
+        if bounds is None:
+            return None
+        y1, y2, x1, x2 = bounds
+        img_np = self._image_to_numpy(img)
+        return img_np[y1:y2, x1:x2, :]
+
+    def _render_trace_row(self, axes, row_idx, label, input_patch=None, reps=None, child_patches=None):
+        axes[row_idx, 0].text(0.5, 0.5, label, ha="center", va="center", fontsize=8)
+        axes[row_idx, 0].axis("off")
+
+        n_cols = axes.shape[1]
+        for col_idx in range(1, n_cols):
+            axes[row_idx, col_idx].axis("off")
+
+        if input_patch is not None:
+            axes[row_idx, 1].imshow(input_patch)
+            axes[row_idx, 1].axis("off")
+
+        if child_patches is not None:
+            for i, (title, patch) in enumerate(child_patches):
+                col_idx = 2 + i
+                if col_idx >= n_cols:
+                    break
+                if patch is None:
+                    axes[row_idx, col_idx].text(0.5, 0.5, title, ha="center", va="center", fontsize=8)
+                else:
+                    axes[row_idx, col_idx].imshow(patch)
+                    axes[row_idx, col_idx].set_title(title, fontsize=7)
+                axes[row_idx, col_idx].axis("off")
+
+        if reps is not None:
+            for i, rep in enumerate(reps):
+                col_idx = 2 + i
+                if col_idx >= n_cols:
+                    break
+                axes[row_idx, col_idx].imshow(rep)
+                axes[row_idx, col_idx].set_title(f"repr{i + 1}", fontsize=7)
+                axes[row_idx, col_idx].axis("off")
+
+    def _expansion_rows(
+        self, img, all_results, labels_by_checkpoint, parent_stage, parent_pos,
+        trace_block="last", k_nearest=4
+    ):
+        child_stage = parent_stage - 1
+        children = self._children_for_parent(child_stage, parent_pos)
+        parent_patch = self._stage_patch(img, parent_stage, parent_pos)
+        child_patches = []
+        for child in children:
+            if child["is_pad"] or child["pos"] is None:
+                child_patches.append(("PAD", None))
+            else:
+                child_patches.append((
+                    f"s{child_stage} p{child['pos']}",
+                    self._stage_patch(img, child_stage, child["pos"])
+                ))
+
+        rows = [{
+            "label": f"s{parent_stage} p{parent_pos}\n-> s{child_stage}",
+            "input_patch": parent_patch,
+            "child_patches": child_patches,
+        }]
+
+        for child in children:
+            if child["is_pad"] or child["pos"] is None:
+                rows.append({
+                    "label": f"s{child_stage}\nPAD",
+                    "input_patch": None,
+                    "reps": [],
+                })
+                continue
+            block_idx, cluster, reps = self._cluster_and_representatives_for_pos(
+                all_results, labels_by_checkpoint, child_stage, child["pos"],
+                trace_block=trace_block, k_nearest=k_nearest
+            )
+            rows.append({
+                "label": f"s{child_stage} b{block_idx}\npos{child['pos']}\ncluster {cluster}",
+                "input_patch": self._stage_patch(img, child_stage, child["pos"]),
+                "reps": reps,
+            })
+
+        valid_children = [
+            child for child in children
+            if not child["is_pad"] and child["pos"] is not None
+        ]
+        return rows, valid_children
+
+    def _save_trace_page(self, rows, save_path, title, n_cols):
+        fig_h = max(2.5, 1.6 * len(rows))
+        fig, axes = plt.subplots(len(rows), n_cols, figsize=(2.0 * n_cols, fig_h))
+        if len(rows) == 1:
+            axes = axes.reshape(1, -1)
+
+        for row_idx, row in enumerate(rows):
+            self._render_trace_row(
+                axes, row_idx, row["label"],
+                input_patch=row.get("input_patch"),
+                reps=row.get("reps"),
+                child_patches=row.get("child_patches"),
+            )
+
+        plt.suptitle(title, fontsize=11)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150)
+        plt.close(fig)
+
+    def _make_stage3_summary_row(
+        self, img, all_results, labels_by_checkpoint, top_item,
+        trace_block="last", k_nearest=4
+    ):
+        last_stage_idx = len(self.stage_resolutions) - 1
+        pos = int(top_item["pos"])
+        block_idx, cluster, reps = self._cluster_and_representatives_for_pos(
+            all_results, labels_by_checkpoint, last_stage_idx, pos,
+            trace_block=trace_block, k_nearest=k_nearest
+        )
+        return {
+            "label": (
+                f"top {top_item['rank']}\n"
+                f"s{last_stage_idx} b{block_idx}\n"
+                f"pos{pos}\ncluster {cluster}"
+            ),
+            "input_patch": self._stage_patch(img, last_stage_idx, pos),
+            "reps": reps,
+        }
+
+    def save_topk_trace_representative_pages(
+        self, img, all_results, labels_by_checkpoint, gradcam_result,
+        trace_dir, trace_block="last", k_nearest=4,
+        max_rows_per_fig=12, expansions_per_fig=2
+    ):
+        """
+        每個 top-k patch 產生分頁 trace card。
+        一個 expansion 不切頁；預設每頁 2 組 expansion，共 10 列。
+        """
+        trace_dir = Path(trace_dir)
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        last_stage_idx = len(self.stage_resolutions) - 1
+        n_cols = max(2 + k_nearest, 2 + max(
+            int(info["m_h"] or 0) * int(info["m_w"] or 0)
+            for info in self.stage_resolutions
+        ))
+        max_expansion_rows = max(
+            1 + int(info["m_h"] or 0) * int(info["m_w"] or 0)
+            for info in self.stage_resolutions
+            if info["has_merge"]
+        )
+        max_fit = max(1, int(max_rows_per_fig) // max_expansion_rows)
+        expansions_per_fig = max(1, min(int(expansions_per_fig), max_fit))
+
+        for top_item in gradcam_result["top_positions"]:
+            rank = int(top_item["rank"])
+            top_pos = int(top_item["pos"])
+            queue = [(last_stage_idx, top_pos)]
+            pending_expansions = []
+            page = 1
+
+            summary_row = self._make_stage3_summary_row(
+                img, all_results, labels_by_checkpoint, top_item,
+                trace_block=trace_block, k_nearest=k_nearest
+            )
+            first_rows = [summary_row]
+            if queue:
+                parent_stage, parent_pos = queue.pop(0)
+                rows, children = self._expansion_rows(
+                    img, all_results, labels_by_checkpoint,
+                    parent_stage, parent_pos,
+                    trace_block=trace_block, k_nearest=k_nearest
+                )
+                first_rows.extend(rows)
+                for child in children:
+                    if child["stage"] > 0:
+                        queue.append((child["stage"], child["pos"]))
+
+            self._save_trace_page(
+                first_rows,
+                trace_dir / f"top{rank:02d}_pos{top_pos}_trace_page{page:02d}.png",
+                f"Top {rank} pos{top_pos} trace page {page}",
+                n_cols,
+            )
+            page += 1
+
+            while queue:
+                pending_expansions = []
+                for _ in range(expansions_per_fig):
+                    if not queue:
+                        break
+                    parent_stage, parent_pos = queue.pop(0)
+                    rows, children = self._expansion_rows(
+                        img, all_results, labels_by_checkpoint,
+                        parent_stage, parent_pos,
+                        trace_block=trace_block, k_nearest=k_nearest
+                    )
+                    pending_expansions.extend(rows)
+                    for child in children:
+                        if child["stage"] > 0:
+                            queue.append((child["stage"], child["pos"]))
+
+                if len(pending_expansions) > max_rows_per_fig:
+                    print(
+                        f"警告: trace page 有 {len(pending_expansions)} 列，"
+                        f"超過 max_rows_per_fig={max_rows_per_fig}"
+                    )
+                self._save_trace_page(
+                    pending_expansions,
+                    trace_dir / f"top{rank:02d}_pos{top_pos}_trace_page{page:02d}.png",
+                    f"Top {rank} pos{top_pos} trace page {page}",
+                    n_cols,
+                )
+                page += 1
 
     def extract_features_before_merge(self, stage_idx, max_samples=None):
         """
@@ -394,7 +1095,7 @@ class ViTAnalyzer:
         y1, y2 = row * patch_h, (row + 1) * patch_h
         x1, x2 = col * patch_w, (col + 1) * patch_w
         
-        img_np = full_img.permute(1, 2, 0).numpy()
+        img_np = self._image_to_numpy(full_img)
         patch = img_np[int(y1):int(y2), int(x1):int(x2), :]
         return np.clip(patch, 0, 1)
 
@@ -417,6 +1118,9 @@ class ViTAnalyzer:
         kmeans_dict = {}
         cluster_centers = {}
         n_pos = len(positions)
+        n_clusters = self._effective_n_clusters(
+            n_clusters, features.shape[0], context="per-position K-means"
+        )
         
         for i, p in enumerate(positions):
             X = features[:, p, :].numpy()  # [N_samples, C]
@@ -464,6 +1168,9 @@ class ViTAnalyzer:
         cluster_centers = {}
         total = len(positions) * len(heads)
         done = 0
+        n_clusters = self._effective_n_clusters(
+            n_clusters, features_heads.shape[0], context="per-head K-means"
+        )
 
         for p in positions:
             for h in heads:
@@ -703,8 +1410,8 @@ class ViTAnalyzer:
         label_grid = label_arr.reshape(H, W).astype(float)
 
         fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-        img_np = img.permute(1, 2, 0).numpy()
-        axes[0].imshow(np.clip(img_np, 0, 1))
+        img_np = self._image_to_numpy(img)
+        axes[0].imshow(img_np)
         axes[0].set_title('Original')
         axes[0].axis('off')
 
@@ -959,9 +1666,12 @@ class ViTAnalyzer:
         patch_w = self.img_size // W
         print(f"  每 token 對應原圖: {patch_h}x{patch_w} 像素")
         
+        effective_n_clusters = self._effective_n_clusters(
+            n_clusters, features.shape[0], context=f"stage {stage_idx} K-means"
+        )
         print("  對每個位置做 K-means...")
         kmeans_dict, _ = self.run_kmeans_per_position(
-            features, n_clusters=n_clusters, positions=positions
+            features, n_clusters=effective_n_clusters, positions=positions
         )
         
         print("  取得各群聚的代表圖...")
@@ -980,7 +1690,7 @@ class ViTAnalyzer:
         
         print("  視覺化...")
         self.visualize_position_clusters(
-            representatives, (H, W), n_clusters, k_nearest,
+            representatives, (H, W), effective_n_clusters, k_nearest,
             positions_to_show=positions_to_show, save_path=save_dir,
             clusters_per_fig=10
         )
@@ -991,6 +1701,7 @@ class ViTAnalyzer:
             'kmeans_dict': kmeans_dict,
             'representatives': representatives,
             'H': H, 'W': W,
+            'n_clusters': effective_n_clusters,
         }
 
     def full_analysis_all_stages_blocks(
@@ -999,7 +1710,10 @@ class ViTAnalyzer:
         m_inference=None, inference_seed=42,
         clusters_per_fig=10, n_clusters_per_stage=None,
         save_cluster_representatives=True,
-        mode="token", heads=None
+        mode="token", heads=None,
+        gradcam_top_k=10, trace_block="last", save_gradcam_trace=True,
+        trace_max_rows_per_fig=12, trace_expansions_per_fig=2,
+        save_all_inference_repr=False
     ):
         """
         對每個 stage、每個 block 做 K-means 分析並存代表圖。
@@ -1015,6 +1729,12 @@ class ViTAnalyzer:
             save_cluster_representatives: 是否儲存每個 stage/block/position 的 cluster 代表圖
             mode: "token"（舊流程）或 "head"（per-head 分析）
             heads: mode="head" 時可指定要分析的 head 索引列表，None 表示全部 head
+            gradcam_top_k: inference 時用 GradCAM 在最後 stage 取前 k 個 token；None 或 <=0 表示不輸出 trace
+            trace_block: "last"、"all" 或指定 block index，用於輸出 traced positions 的 cluster
+            save_gradcam_trace: 是否輸出 GradCAM top-k 回溯 JSON/視覺化
+            trace_max_rows_per_fig: trace representative page 每張最多列數
+            trace_expansions_per_fig: trace representative page 每張最多放幾組 parent expansion
+            save_all_inference_repr: 是否保留舊行為，存所有非 top-k position 的 repr 圖
         """
         if save_dir is None:
             save_dir = Path(__file__).resolve().parent / 'plots' / 'kmeans_all_stages_blocks'
@@ -1036,7 +1756,11 @@ class ViTAnalyzer:
             for cp_idx, ((stage_idx, block_idx), (features, H, W)) in enumerate(
                 [(k, all_features[k]) for k in checkpoints]
             ):
-                nc = n_clusters_per_stage.get(stage_idx, n_clusters) if n_clusters_per_stage else n_clusters
+                requested_nc = n_clusters_per_stage.get(stage_idx, n_clusters) if n_clusters_per_stage else n_clusters
+                nc = self._effective_n_clusters(
+                    requested_nc, features.shape[0],
+                    context=f"stage {stage_idx} block {block_idx} K-means"
+                )
                 stage_dir = save_dir / f"stage{stage_idx}_block{block_idx}"
                 stage_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1082,7 +1806,13 @@ class ViTAnalyzer:
             if m_inference is not None and m_inference > 0:
                 self._infer_and_save_m_images(
                     all_results, m_inference, n_clusters, k_nearest,
-                    save_dir, inference_seed, n_clusters_per_stage
+                    save_dir, inference_seed, n_clusters_per_stage,
+                    gradcam_top_k=gradcam_top_k,
+                    trace_block=trace_block,
+                    save_gradcam_trace=save_gradcam_trace,
+                    trace_max_rows_per_fig=trace_max_rows_per_fig,
+                    trace_expansions_per_fig=trace_expansions_per_fig,
+                    save_all_inference_repr=save_all_inference_repr
                 )
             return all_results
 
@@ -1097,7 +1827,11 @@ class ViTAnalyzer:
         for cp_idx, ((stage_idx, block_idx), (features_heads, H, W)) in enumerate(
             [(k, all_head_features[k]) for k in checkpoints]
         ):
-            nc = n_clusters_per_stage.get(stage_idx, n_clusters) if n_clusters_per_stage else n_clusters
+            requested_nc = n_clusters_per_stage.get(stage_idx, n_clusters) if n_clusters_per_stage else n_clusters
+            nc = self._effective_n_clusters(
+                requested_nc, features_heads.shape[0],
+                context=f"stage {stage_idx} block {block_idx} per-head K-means"
+            )
             stage_dir = save_dir / f"stage{stage_idx}_block{block_idx}"
             stage_dir.mkdir(parents=True, exist_ok=True)
             per_pos_dir = stage_dir / "per_position"
@@ -1181,20 +1915,23 @@ class ViTAnalyzer:
 
     def _infer_and_save_m_images(
         self, all_results, m, n_clusters, k_nearest, save_dir, seed=42,
-        n_clusters_per_stage=None
+        n_clusters_per_stage=None, gradcam_top_k=10, trace_block="last",
+        save_gradcam_trace=True, trace_max_rows_per_fig=12,
+        trace_expansions_per_fig=2, save_all_inference_repr=False
     ):
         """
         隨機取 m 張圖，對每個 (stage, block) 推論 cluster 指派並存檔。
         使用單次 forward 取得所有 checkpoint 特徵，避免重複計算。
         儲存: inference/img{i}_original.png, inference/img{i}_s{s}_b{b}.png
-              inference/img{i}_s{s}_b{b}_repr_pos{pos}_cluster{c}.png
-              (每個位置對應 cluster 的代表圖，1 個 pos 存 1 張)
+              inference/gradcam_trace/img{i}/... top-k trace 圖與代表圖。
+              若 save_all_inference_repr=True，才額外儲存所有 position 的舊版 repr 圖。
         """
         inference_dir = save_dir / "inference"
         inference_dir.mkdir(parents=True, exist_ok=True)
         
         print(f"\n=== 隨機取 {m} 張圖推論 cluster 指派 ===")
         sample_imgs = self.sample_random_images(m, seed=seed)
+        trace_jsonl_path = inference_dir / "gradcam_trace_clusters.jsonl"
         
         with torch.no_grad():
             imgs = sample_imgs.to(self.device)
@@ -1205,12 +1942,13 @@ class ViTAnalyzer:
             pct_img = 100 * (img_idx + 1) / n_imgs if n_imgs > 0 else 0
             print(f"\n  推論進度: 圖 {img_idx+1}/{n_imgs} ({pct_img:.0f}%)")
             img = sample_imgs[img_idx]
-            img_np = np.clip(img.permute(1, 2, 0).numpy(), 0, 1)
+            img_np = self._image_to_numpy(img)
             fig, ax = plt.subplots(figsize=(4, 4))
             ax.imshow(img_np)
             ax.axis('off')
             plt.savefig(inference_dir / f"img{img_idx}_original.png", bbox_inches='tight', pad_inches=0, dpi=150)
             plt.close(fig)
+            labels_by_checkpoint = {}
             for (stage_idx, block_idx), res in all_results.items():
                 kmeans_dict = res['kmeans_dict']
                 representatives = res['representatives']
@@ -1221,18 +1959,65 @@ class ViTAnalyzer:
                 
                 feat = infer_checkpoints[(stage_idx, block_idx)][0][img_idx:img_idx + 1].cpu()
                 labels = self.assign_input_to_clusters(feat, kmeans_dict)
-                labels_single = {p: labels[p][0] for p in labels}
+                labels_single = {int(p): int(labels[p][0]) for p in labels}
+                labels_by_checkpoint[(int(stage_idx), int(block_idx))] = labels_single
                 
                 save_path = inference_dir / f"img{img_idx}_s{stage_idx}_b{block_idx}.png"
                 self.visualize_and_save_cluster_assignment(
                     sample_imgs[img_idx], labels_single, H, W, nc,
                     save_path
                 )
-                self._save_inference_repr(
-                    sample_imgs[img_idx], labels_single, representatives,
-                    k_nearest, H, W, inference_dir, img_idx, stage_idx, block_idx
+                if save_all_inference_repr:
+                    self._save_inference_repr(
+                        sample_imgs[img_idx], labels_single, representatives,
+                        k_nearest, H, W, inference_dir, img_idx, stage_idx, block_idx
+                    )
+
+            if save_gradcam_trace and gradcam_top_k is not None and gradcam_top_k > 0:
+                gradcam_result = self.compute_gradcam_topk(
+                    img, top_k=gradcam_top_k
                 )
-            print(f"    已存 img{img_idx} 的原始圖、cluster 指派圖與代表圖")
+                traces = self.trace_last_stage_positions(
+                    gradcam_result["top_positions"]
+                )
+                trace_payload = self.build_gradcam_trace_payload(
+                    img_idx, gradcam_result, traces, labels_by_checkpoint,
+                    trace_block=trace_block
+                )
+
+                per_img_json = inference_dir / f"img{img_idx}_gradcam_trace_clusters.json"
+                with open(per_img_json, "w", encoding="utf-8") as f:
+                    json.dump(trace_payload, f, ensure_ascii=False, indent=2)
+
+                mode = "w" if img_idx == 0 else "a"
+                with open(trace_jsonl_path, mode, encoding="utf-8") as f:
+                    f.write(json.dumps(trace_payload, ensure_ascii=False) + "\n")
+
+                trace_dir = inference_dir / "gradcam_trace" / f"img{img_idx}"
+                trace_dir.mkdir(parents=True, exist_ok=True)
+                self.save_gradcam_topk_overview(
+                    img, gradcam_result,
+                    trace_dir / f"img{img_idx}_gradcam_top{gradcam_top_k}_overview.png"
+                )
+                self.save_gradcam_trace_summary(
+                    gradcam_result, traces,
+                    trace_dir / f"img{img_idx}_gradcam_top{gradcam_top_k}_trace_summary.png"
+                )
+                self.save_topk_trace_representative_pages(
+                    img, all_results, labels_by_checkpoint, gradcam_result,
+                    trace_dir,
+                    trace_block=trace_block,
+                    k_nearest=k_nearest,
+                    max_rows_per_fig=trace_max_rows_per_fig,
+                    expansions_per_fig=trace_expansions_per_fig
+                )
+                print(f"    已存 img{img_idx} 的 GradCAM top-{gradcam_top_k} 回溯 cluster JSON")
+            msg = f"    已存 img{img_idx} 的原始圖與 cluster 指派圖"
+            if save_gradcam_trace and gradcam_top_k is not None and gradcam_top_k > 0:
+                msg += "、GradCAM top-k trace 圖"
+            if save_all_inference_repr:
+                msg += "、所有 position 代表圖"
+            print(msg)
 
     def _save_inference_repr(
         self, img, labels_single, representatives, k_nearest,
@@ -1242,8 +2027,6 @@ class ViTAnalyzer:
         對每個 position 顯示其被分到的 cluster 的代表圖，並各自單獨存檔。
         格式：Pos X → Cluster Y | 原圖該 pos 的 patch | k 張 cluster 代表 patch。
         """
-        patch_h = self.img_size // H
-        patch_w = self.img_size // W
         n_cols = 1 + 1 + k_nearest  # 標籤 + 原圖 patch + 代表 patch
         positions = sorted(labels_single.keys())
 
@@ -1258,7 +2041,7 @@ class ViTAnalyzer:
                 ha='center', va='center', fontsize=10
             )
             axes[0].axis('off')
-            orig_patch = self.get_patch_from_image(img, pos, H, W, patch_h, patch_w)
+            orig_patch = self._stage_patch(img, stage_idx, pos)
             axes[1].imshow(orig_patch)
             axes[1].set_title('Input', fontsize=8)
             axes[1].axis('off')
@@ -1299,10 +2082,13 @@ def run_colored_mnist_analysis(
     sys.path.insert(0, '.')
     from dataloader import get_dataloader
     
-    train_loader, _ = get_dataloader(
+    train_loader, test_loader = get_dataloader(
         dataset=dataset, root='./data/', batch_size=32,
         input_size=(img_size, img_size)
     )
+    analysis_loader = test_loader if dataset == 'Caltech101' else train_loader
+    display_mean = IMAGENET_MEAN if dataset == 'Caltech101' else None
+    display_std = IMAGENET_STD if dataset == 'Caltech101' else None
     
     _patch = patch_size
     _embed = [64, 128, 256, 512]
@@ -1328,7 +2114,10 @@ def run_colored_mnist_analysis(
     elif model_path:
         print(f"警告: 找不到 checkpoint，使用隨機初始化")
     
-    analyzer = ViTAnalyzer(model, train_loader, img_size=img_size)
+    analyzer = ViTAnalyzer(
+        model, analysis_loader, img_size=img_size,
+        display_mean=display_mean, display_std=display_std
+    )
     result = analyzer.full_analysis_pipeline(
         stage_idx=stage_idx, max_samples=max_samples,
         n_clusters=n_clusters, k_nearest=k_nearest, positions=positions
@@ -1349,7 +2138,10 @@ def run_colored_mnist_analysis_all(
     m_inference=None, inference_seed=42, clusters_per_fig=10,
     n_clusters_per_stage=None, model_args=None, data_root=None,
     save_cluster_representatives=True,
-    mode="token", heads=None, analysis_batch_size=32
+    mode="token", heads=None, analysis_batch_size=32,
+    model_name=None, gradcam_top_k=10, trace_block="last",
+    save_gradcam_trace=True, trace_max_rows_per_fig=12,
+    trace_expansions_per_fig=2, save_all_inference_repr=False
 ):
     """
     對每個 stage、每個 block、每個 position 存代表圖。
@@ -1365,12 +2157,16 @@ def run_colored_mnist_analysis_all(
     import sys
     sys.path.insert(0, '.')
     from dataloader import get_dataloader
+    _validate_mergingvit_model_args(model_args=model_args, model_name=model_name)
     
     _root = data_root if data_root is not None else str(Path(__file__).resolve().parent.parent / 'data')
-    train_loader, _ = get_dataloader(
+    train_loader, test_loader = get_dataloader(
         dataset=dataset, root=_root, batch_size=analysis_batch_size,
         input_size=(img_size, img_size)
     )
+    analysis_loader = test_loader if dataset == 'Caltech101' else train_loader
+    display_mean = IMAGENET_MEAN if dataset == 'Caltech101' else None
+    display_std = IMAGENET_STD if dataset == 'Caltech101' else None
     
     if model_args is not None:
         # 從 config 的 model args 建立模型，確保與訓練時完全一致
@@ -1414,7 +2210,10 @@ def run_colored_mnist_analysis_all(
         model.load_state_dict(state_to_load, strict=True)
         print(f"已載入模型: {path}")
     
-    analyzer = ViTAnalyzer(model, train_loader, img_size=img_size)
+    analyzer = ViTAnalyzer(
+        model, analysis_loader, img_size=img_size,
+        display_mean=display_mean, display_std=display_std
+    )
     return analyzer.full_analysis_all_stages_blocks(
         max_samples=max_samples,
         n_clusters=n_clusters,
@@ -1427,7 +2226,13 @@ def run_colored_mnist_analysis_all(
         n_clusters_per_stage=n_clusters_per_stage,
         save_cluster_representatives=save_cluster_representatives,
         mode=mode,
-        heads=heads
+        heads=heads,
+        gradcam_top_k=gradcam_top_k,
+        trace_block=trace_block,
+        save_gradcam_trace=save_gradcam_trace,
+        trace_max_rows_per_fig=trace_max_rows_per_fig,
+        trace_expansions_per_fig=trace_expansions_per_fig,
+        save_all_inference_repr=save_all_inference_repr
     )
 
 
@@ -1435,9 +2240,11 @@ if __name__ == "__main__":
     import config as cfg
 
     # 從 config 讀取設定
+    model_name = cfg.config["model"]["name"]
     model_args = cfg.config["model"]["args"]
     ckpt_dir = cfg.config.get("kmeans_checkpoint_dir") or cfg.config["save_dir"]
-    model_path = str(Path(cfg.config["root"]) / ckpt_dir / f"{cfg.config['model']['name']}_best.pth")
+    _validate_mergingvit_model_args(model_args=model_args, model_name=model_name)
+    model_path = str(Path(cfg.config["root"]) / ckpt_dir / f"{model_name}_best.pth")
     dataset = cfg.config["dataset"]
     input_shape = cfg.config["input_shape"]
     clusters_list = cfg.config.get("kmeans_clusters_per_stage", [30, 60, 120, 240])
@@ -1455,14 +2262,14 @@ if __name__ == "__main__":
         model_path=model_path,
         dataset=dataset,
         img_size=input_shape[0],
-        patch_size=model_args.get("patch_size", 2),
+        patch_size=model_args.get("patch_size", 8),
         max_samples=None,  # 可設 500 加速
         n_clusters_per_stage=n_clusters_per_stage,
         k_nearest=4,
         clusters_per_fig=1,  # 每 10 個 cluster 一張圖
         positions=None,  # None=全部位置；可傳 [0,1,105] 等子集加速
         save_dir='plots/kmeans/Caltech101/',   # 預設 plots/kmeans_all_stages_blocks/
-        m_inference=10,   # 隨機取 m 張圖推論 cluster 指派並存檔
+        m_inference=5,   # 隨機取 m 張圖推論 cluster 指派並存檔
         inference_seed=42,
         save_cluster_representatives=False,  # 只存 inference 圖，不存每個 cluster 代表圖
         model_args=model_args,  # 從 config 傳入，含 merge_size 等
@@ -1470,4 +2277,11 @@ if __name__ == "__main__":
         mode="token",
         heads=None,
         analysis_batch_size=cfg.config.get("batch_size", 4),
+        model_name=model_name,
+        gradcam_top_k=cfg.config.get("gradcam_trace_top_k", 5),
+        trace_block=cfg.config.get("gradcam_trace_block", "last"),
+        save_gradcam_trace=cfg.config.get("save_gradcam_trace", True),
+        trace_max_rows_per_fig=cfg.config.get("trace_max_rows_per_fig", 12),
+        trace_expansions_per_fig=cfg.config.get("trace_expansions_per_fig", 2),
+        save_all_inference_repr=cfg.config.get("save_all_inference_repr", False),
     )

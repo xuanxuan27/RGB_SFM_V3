@@ -9,6 +9,8 @@ class Swin_tiny(nn.Module):
             'swin_tiny_patch4_window7_224',
             pretrained=False,
             num_classes=0,  # ← 先不建立分類頭
+            drop_rate=0.2,
+            drop_path_rate=0.2,
         )
         # 再手動加上新的分類頭
         self.head = nn.Linear(768, out_channels)
