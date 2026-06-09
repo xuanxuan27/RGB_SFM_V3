@@ -46,6 +46,9 @@ class HeartCalcificationDataset(Dataset):
         need_augmentation =  augment_positive
         if not self.train:
             need_augmentation = False
+            # 還原真實情況，不要做資料擴充
+            # use_min_count = False
+
 
         print(f"is train :{train}")
         print(f"augment_positive :{augment_positive}")

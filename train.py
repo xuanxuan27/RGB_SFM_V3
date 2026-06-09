@@ -1,3 +1,4 @@
+import copy
 import shutil
 
 import wandb
@@ -18,6 +19,37 @@ from models.RGB_SFMCNN_V2 import get_feature_extraction_layers, get_basic_target
 from monitor.monitor_method import get_all_layers_stats
 
 
+def print_binary_metrics(targets, preds):
+    targets = np.asarray(targets)
+    preds = np.asarray(preds)
+
+    tn = int(((targets == 0) & (preds == 0)).sum())
+    fp = int(((targets == 0) & (preds == 1)).sum())
+    fn = int(((targets == 1) & (preds == 0)).sum())
+    tp = int(((targets == 1) & (preds == 1)).sum())
+
+    eps = 1e-8
+    accuracy = (tp + tn) / max(tp + tn + fp + fn, 1)
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    specificity = tn / (tn + fp + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+    balanced_acc = (recall + specificity) / 2
+
+    print("\nConfusion Matrix:")
+    print("              Pred 0    Pred 1")
+    print(f"Actual 0      {tn:6d}    {fp:6d}")
+    print(f"Actual 1      {fn:6d}    {tp:6d}")
+
+    print("\nMetrics:")
+    print(f"Accuracy      : {accuracy:.4f}")
+    print(f"Precision     : {precision:.4f}")
+    print(f"Recall/Sens.  : {recall:.4f}")
+    print(f"Specificity   : {specificity:.4f}")
+    print(f"F1-score      : {f1:.4f}")
+    print(f"Balanced Acc. : {balanced_acc:.4f}\n")
+
+
 
 def train(train_dataloader: DataLoader, valid_dataloader: DataLoader, model: nn.Module, eval_loss_fn, optimizer, scheduler, epoch, device,
           training_loss_fn, use_metric_based_loss=False):
@@ -34,7 +66,7 @@ def train(train_dataloader: DataLoader, valid_dataloader: DataLoader, model: nn.
     checkpoint = {}
 
     # ???? RM ????
-    need_calculate_status = arch["need_calculate_status"]
+    need_calculate_status = arch.get("need_calculate_status", False)
     if need_calculate_status:
         # ???????
         mode = arch['args']['mode']
@@ -151,9 +183,9 @@ def train(train_dataloader: DataLoader, valid_dataloader: DataLoader, model: nn.
             cur_train_acc = train_acc     
             count = 0
             checkpoint = {
-                'model_weights': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
+                'model_weights': copy.deepcopy(model.state_dict()),
+                'optimizer': copy.deepcopy(optimizer.state_dict()),
+                'scheduler': copy.deepcopy(scheduler.state_dict()),
                 'train_loss': train_loss,
                 'train_acc': train_acc,
                 'valid_loss': valid_loss,
@@ -200,13 +232,16 @@ def train(train_dataloader: DataLoader, valid_dataloader: DataLoader, model: nn.
 
     return cur_train_loss, cur_train_acc, best_valid_loss, best_valid_acc, checkpoint
 
-def eval(dataloader: DataLoader, model: nn.Module, loss_fn, need_table = True, device=None, use_preprocessed_image = False):
+def eval(dataloader: DataLoader, model: nn.Module, loss_fn, need_table=True, device=None,
+         use_preprocessed_image=False, print_metrics=False):
     progress = tqdm(enumerate(dataloader), desc="Loss: ", total=len(dataloader))
     model.eval()
     losses = 0
     correct = 0
     size = 0
     table = []
+    all_targets = []
+    all_preds = []
     with torch.no_grad():
         for batch, (X, y) in progress:
             X = X.to(device); y= y.to(device)
@@ -225,7 +260,10 @@ def eval(dataloader: DataLoader, model: nn.Module, loss_fn, need_table = True, d
             else:
                 targets = y.argmax(1)
 
-            correct += (pred.argmax(1) == targets).type(torch.float).sum().item()
+            preds = pred.argmax(1)
+            correct += (preds == targets).type(torch.float).sum().item()
+            all_targets.extend(targets.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
 
             if need_table:
                 X = X.cpu()
@@ -238,12 +276,14 @@ def eval(dataloader: DataLoader, model: nn.Module, loss_fn, need_table = True, d
                 else:
                     X = np.array(X[0])
 
-                batch_correct = (pred.argmax(1) == targets).type(torch.float).sum().item()
-                table.append([wandb.Image(X), targets_cpu[0], pred.argmax(1)[0], loss, batch_correct])
+                batch_correct = (preds == targets).type(torch.float).sum().item()
+                table.append([wandb.Image(X), targets_cpu[0], preds[0].cpu(), loss, batch_correct])
 
             test_loss = losses/(batch+1)
             test_acc = correct/size
             progress.set_description("Loss: {:.7f}, Accuracy: {:.7f}".format(test_loss, test_acc))
+    if print_metrics:
+        print_binary_metrics(all_targets, all_preds)
     return test_acc, test_loss, table
 
 config['save_dir'] = increment_path(config['save_dir'], exist_ok = False)
@@ -294,7 +334,7 @@ print("Valid: \n\tAccuracy: {}, Avg loss: {} \n".format(valid_acc, valid_loss))
 
 # print(f"check point {checkpoint}")
 
-test_acc, test_loss, test_table = eval(test_dataloader, model, eval_loss_fn, device = config['device'], need_table=False, use_preprocessed_image=config['use_preprocessed_image'])
+test_acc, test_loss, test_table = eval(test_dataloader, model, eval_loss_fn, device = config['device'], need_table=False, use_preprocessed_image=config['use_preprocessed_image'], print_metrics=True)
 print("Test 1: \n\tAccuracy: {}, Avg loss: {} \n".format(test_acc, test_loss))
 
 # Test model
@@ -303,7 +343,7 @@ if 'model_weights' not in checkpoint:
 else:
     model.load_state_dict(checkpoint['model_weights'])
 model.to(device)
-test_acc, test_loss, test_table = eval(test_dataloader, model, eval_loss_fn, device = config['device'], need_table=False, use_preprocessed_image=config['use_preprocessed_image'])
+test_acc, test_loss, test_table = eval(test_dataloader, model, eval_loss_fn, device = config['device'], need_table=False, use_preprocessed_image=config['use_preprocessed_image'], print_metrics=True)
 print("Test 2: \n\tAccuracy: {}, Avg loss: {} \n".format(test_acc, test_loss))
 
 # Record result into Wandb
