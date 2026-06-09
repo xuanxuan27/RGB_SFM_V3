@@ -1508,31 +1508,34 @@ class ViTAnalyzer:
             images: [m, 3, H_img, W_img]
         """
         if m is None or m <= 0:
-            return torch.empty((0, 3, self.img_size, self.img_size))
+            return torch.empty((0, 3, self.img_size, self.img_size)), torch.empty((0,), dtype=torch.long)
 
         rng = np.random.default_rng(seed)
-        sampled = []  # reservoir
+        sampled = []   # (img, label)
         seen = 0
 
-        for imgs, _ in self.dataloader:
+        for imgs, lbls in self.dataloader:
             imgs_cpu = imgs.cpu()
+            # lbls 可能是 one-hot，統一轉成 argmax 整數
+            if lbls.dim() > 1:
+                lbls = lbls.argmax(dim=1)
+            lbls_cpu = lbls.cpu()
             for i in range(imgs_cpu.shape[0]):
-                img = imgs_cpu[i]
                 seen += 1
                 if len(sampled) < m:
-                    sampled.append(img)
+                    sampled.append((imgs_cpu[i], lbls_cpu[i]))
                 else:
                     j = int(rng.integers(0, seen))
                     if j < m:
-                        sampled[j] = img
+                        sampled[j] = (imgs_cpu[i], lbls_cpu[i])
 
         if len(sampled) == 0:
-            return torch.empty((0, 3, self.img_size, self.img_size))
+            return torch.empty((0, 3, self.img_size, self.img_size)), torch.empty((0,), dtype=torch.long)
 
-        # 再打散一次輸出順序，避免看起來像原始資料順序
         perm = rng.permutation(len(sampled))
-        images = torch.stack(sampled, dim=0)
-        return images[perm]
+        images = torch.stack([sampled[i][0] for i in perm], dim=0)
+        labels = torch.stack([sampled[i][1] for i in perm], dim=0)
+        return images, labels
 
     def extract_features_for_images(self, images, stage_idx, block_idx):
         """
@@ -2106,12 +2109,14 @@ class ViTAnalyzer:
         inference_dir.mkdir(parents=True, exist_ok=True)
         
         print(f"\n=== 隨機取 {m} 張圖推論 cluster 指派 ===")
-        sample_imgs = self.sample_random_images(m, seed=seed)
+        sample_imgs, sample_gt_labels = self.sample_random_images(m, seed=seed)
         trace_jsonl_path = inference_dir / "gradcam_trace_clusters.jsonl"
         
         with torch.no_grad():
             imgs = sample_imgs.to(self.device)
             infer_checkpoints = get_all_features_at_checkpoints(self.model, imgs)
+            logits = self.model(imgs)
+            sample_pred_labels = logits.argmax(dim=1).cpu()
         
         n_imgs = sample_imgs.shape[0]
         for img_idx in range(n_imgs):
@@ -2119,11 +2124,27 @@ class ViTAnalyzer:
             print(f"\n  推論進度: 圖 {img_idx+1}/{n_imgs} ({pct_img:.0f}%)")
             img = sample_imgs[img_idx]
             img_np = self._image_to_numpy(img)
-            fig, ax = plt.subplots(figsize=(4, 4))
+
+            # 顯示 GT 和 Pred 的 label 名稱
+            gt = int(sample_gt_labels[img_idx].item())
+            pred = int(sample_pred_labels[img_idx].item())
+            label_names = {0: "Normal", 1: "Calcification"}
+            gt_name = label_names.get(gt, str(gt))
+            pred_name = label_names.get(pred, str(pred))
+            correct = (gt == pred)
+            title_color = "lime" if correct else "red"
+            title_str = f"GT: {gt_name}  |  Pred: {pred_name}"
+
+            fig, ax = plt.subplots(figsize=(4, 4.3))
             ax.imshow(img_np)
+            ax.set_title(title_str, fontsize=10, color=title_color,
+                        bbox=dict(facecolor='black', alpha=0.6, pad=3))
             ax.axis('off')
-            plt.savefig(inference_dir / f"img{img_idx}_original.png", bbox_inches='tight', pad_inches=0, dpi=150)
+            plt.savefig(inference_dir / f"img{img_idx}_original.png",
+                        bbox_inches='tight', pad_inches=0.1, dpi=150)
             plt.close(fig)
+
+
             labels_by_checkpoint = {}
             for (stage_idx, block_idx), res in all_results.items():
                 kmeans_dict = res['kmeans_dict']
