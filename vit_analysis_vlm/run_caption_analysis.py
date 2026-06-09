@@ -36,6 +36,14 @@ INFER_REPR_FILE_PATTERN = re.compile(
     r"^img(\d+)_s(\d+)_b(\d+)_repr_pos(\d+)_cluster(\d+)\.png$",
     re.IGNORECASE,
 )
+SINGLE_ROW_TOP_PATTERN = re.compile(
+    r"^s(\d+)_b(\d+)_pos(\d+)_top(\d+)\.png$",
+    re.IGNORECASE,
+)
+SINGLE_ROW_CHILD_PATTERN = re.compile(
+    r"^s(\d+)_b(\d+)_pos(\d+)_parent_s(\d+)p(\d+)\.png$",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +60,10 @@ class PlotRecord:
     img: int | None
     cluster: int | None
     rel_key: str
+    # single-row 模式專用欄位
+    parent_stage: int | None = None
+    parent_pos: int | None = None
+    top_rank: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +179,73 @@ def discover_inference_repr_images(plots_root: Path) -> list[PlotRecord]:
     )
     return records
 
+def discover_single_row_images(plots_root: Path) -> list[PlotRecord]:
+    """
+    掃描 {plots_root}/single_rows/ 內的 single-row PNG。
+
+    支援兩種命名格式：
+      top-k patch 本身：  s{S}_b{B}_pos{P}_top{R}.png
+      子 patch：          s{S}_b{B}_pos{P}_parent_s{PS}p{PP}.png
+    """
+    single_rows_dir = Path(plots_root).resolve() / "single_rows"
+    if not single_rows_dir.is_dir():
+        raise FileNotFoundError(f"找不到 single_rows 目錄: {single_rows_dir}")
+
+    records: list[PlotRecord] = []
+    for png in sorted(single_rows_dir.glob("*.png")):
+        name = png.name
+
+        m = SINGLE_ROW_TOP_PATTERN.match(name)
+        if m:
+            stage, block, pos, rank = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+            rel = f"single_rows/s{stage}_b{block}_pos{pos}_top{rank:02d}"
+            records.append(PlotRecord(
+                image_path=str(png),
+                stage=stage,
+                block=block,
+                pos=pos,
+                part=None,
+                img=None,
+                cluster=None,
+                rel_key=rel,
+                parent_stage=None,
+                parent_pos=None,
+                top_rank=rank,
+            ))
+            continue
+
+        m = SINGLE_ROW_CHILD_PATTERN.match(name)
+        if m:
+            stage, block, pos = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            parent_stage, parent_pos = int(m.group(4)), int(m.group(5))
+            rel = f"single_rows/s{stage}_b{block}_pos{pos}_parent_s{parent_stage}p{parent_pos}"
+            records.append(PlotRecord(
+                image_path=str(png),
+                stage=stage,
+                block=block,
+                pos=pos,
+                part=None,
+                img=None,
+                cluster=None,
+                rel_key=rel,
+                parent_stage=parent_stage,
+                parent_pos=parent_pos,
+                top_rank=None,
+            ))
+            continue
+
+        # 命名格式不符，略過
+        # print(f"  略過（命名不符）: {name}")
+
+    records.sort(key=lambda r: (
+        r.stage,
+        r.block,
+        r.top_rank if r.top_rank is not None else 999,
+        r.parent_stage if r.parent_stage is not None else -1,
+        r.parent_pos if r.parent_pos is not None else -1,
+        r.pos if r.pos is not None else -1,
+    ))
+    return records
 
 # ---------------------------------------------------------------------------
 # Prompt
@@ -182,6 +261,21 @@ def build_default_prompt() -> str:
         "3. 位置線索：特徵集中在 patch 的哪個區域（上/下/左/右/中）\n"
         "4. 跨樣本一致性：這幾張 patch 之間相似在哪、差異在哪\n\n"
         "最後用一句話總結：這個 cluster 最可能在捕捉圖像中的什麼局部視覺結構。\n"
+        "請用繁體中文回答。"
+    )
+
+def build_single_row_prompt() -> str:
+    return (
+        "這張圖包含一列影像區塊（patch）。\n"
+        "最左邊第一格是從某張圖片的特定空間位置裁出的輸入 patch；"
+        "右側四格是與它歸屬於同一個 K-means cluster 的代表樣本，"
+        "代表了模型在這個位置學習到的典型視覺特徵。\n\n"
+        "請依以下面向分析這五張 patch 的共同視覺特徵：\n"
+        "1. 顏色與對比：主要色調、亮暗分布、前景背景關係\n"
+        "2. 形狀與結構：幾何特徵、紋理方向、邊緣特性\n"
+        "3. 位置線索：視覺特徵集中在 patch 的哪個區域（上/下/左/右/中）\n"
+        "4. 跨樣本一致性：五張 patch 之間相似在哪、差異在哪\n\n"
+        "最後用一句話總結：這個位置的 cluster 最可能在捕捉圖像中的什麼局部視覺結構。\n"
         "請用繁體中文回答。"
     )
 
@@ -849,7 +943,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "圖片根目錄。\n"
             "  scan-mode=repr: 內含 stage{S}_block{B}/repr_pos{P}_part{K}.png\n"
-            "  scan-mode=inference: 內含 img{I}_s{S}_b{B}.png"
+            "  scan-mode=inference: 內含 img{I}_s{S}_b{B}.png\n"
+            "  scan-mode=single-row: 內含 single_rows/*.png（trace 推論結果目錄）"
         ),
     )
     p.add_argument(
@@ -860,7 +955,9 @@ def parse_args() -> argparse.Namespace:
             "掃描模式：\n"
             "  repr: stage{S}_block{B}/repr_pos{P}_part{K}.png\n"
             "  inference: img{I}_s{S}_b{B}.png\n"
-            "  inference-repr-pos: img{I}_s{S}_b{B}_repr_pos{P}_cluster{C}.png"
+            "  inference-repr-pos: img{I}_s{S}_b{B}_repr_pos{P}_cluster{C}.png\n"
+            "  single-row: {plots_root}/single_rows/s{S}_b{B}_pos{P}_top{R}.png\n"
+            "              {plots_root}/single_rows/s{S}_b{B}_pos{P}_parent_s{PS}p{PP}.png"
         ),
     )
     p.add_argument(
@@ -1019,8 +1116,10 @@ def main() -> None:
         records = discover_repr_images(args.plots_root)
     elif args.scan_mode == "inference":
         records = discover_inference_stage_images(args.plots_root)
-    else:
+    elif args.scan_mode == "inference-repr-pos":
         records = discover_inference_repr_images(args.plots_root)
+    else:  # single-row
+        records = discover_single_row_images(args.plots_root)
     records = filter_and_sort_records_by_stage(
         records, stage_start=args.stage_start, stage_end=args.stage_end
     )
@@ -1029,6 +1128,8 @@ def main() -> None:
 
     if args.prompt_file is not None:
         prompt = args.prompt_file.read_text(encoding="utf-8").strip()
+    elif args.scan_mode == "single-row":
+        prompt = build_single_row_prompt()
     else:
         prompt = build_default_prompt()
 
@@ -1051,8 +1152,10 @@ def main() -> None:
             pattern_hint = "repr_pos*_part*.png"
         elif args.scan_mode == "inference":
             pattern_hint = "img*_s*_b*.png"
-        else:
+        elif args.scan_mode == "inference-repr-pos":
             pattern_hint = "img*_s*_b*_repr_pos*_cluster*.png"
+        else:  # single-row
+            pattern_hint = "single_rows/s*_b*_pos*_top*.png 或 single_rows/s*_b*_pos*_parent_s*p*.png"
         print(
             f"在 {args.plots_root.resolve()} 底下找不到符合 stage 範圍 "
             f"{args.stage_start}->{args.stage_end} 的 {pattern_hint}，結束。"

@@ -599,6 +599,66 @@ class ViTAnalyzer:
             return n_samples
         return requested_n_clusters
 
+    # ------------------------------------------------------------------
+    # K-means cache 機制
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _kmeans_cache_path(cache_dir, stage_idx, block_idx, nc):
+        """回傳 kmeans_dict 的 .pkl 路徑與對應的 _meta.json 路徑。"""
+        base = Path(cache_dir) / f"stage{stage_idx}_block{block_idx}_nc{nc}"
+        return base.with_suffix(".pkl"), Path(str(base) + "_meta.json")
+
+    @staticmethod
+    def _kmeans_cache_meta(model_path, dataset, stage_idx, block_idx, nc, max_samples):
+        """建立 cache 有效性比對用的 meta dict。"""
+        import os
+        model_path = str(model_path) if model_path else ""
+        try:
+            mtime = float(os.path.getmtime(model_path)) if model_path else 0.0
+        except OSError:
+            mtime = 0.0
+        return {
+            "model_path": model_path,
+            "model_mtime": mtime,
+            "dataset": str(dataset),
+            "stage": int(stage_idx),
+            "block": int(block_idx),
+            "n_clusters": int(nc),
+            "max_samples": max_samples,
+        }
+
+    @staticmethod
+    def _load_kmeans_cache(pkl_path, meta_path, expected_meta):
+        """
+        比對 meta 後載入 kmeans_dict。
+        meta 不符合或檔案不存在時回傳 None。
+        """
+        import joblib
+        if not pkl_path.exists() or not meta_path.exists():
+            return None
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                saved_meta = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if saved_meta != expected_meta:
+            return None
+        try:
+            return joblib.load(pkl_path)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _save_kmeans_cache(kmeans_dict, pkl_path, meta_path, meta):
+        """將 kmeans_dict 存成 .pkl，並寫入 meta json。"""
+        import joblib
+        pkl_path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(kmeans_dict, pkl_path)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+            
+    #----------------------------------------------------
     def _source_positions_at_stage(self, stage_idx, pos, target_stage=0):
         """將指定 stage 的 token 展開到 target_stage 的真實 source positions。"""
         if stage_idx == target_stage:
@@ -813,6 +873,44 @@ class ViTAnalyzer:
         plt.savefig(save_path, dpi=150)
         plt.close(fig)
 
+    def _save_single_row_image(self, row, save_path, n_repr=4):
+        """
+        將一個「input patch + repr1~repr{n_repr}」的橫列存成單張 PNG。
+        僅處理有 reps 的列（代表圖列），展開列（有 child_patches）不存。
+
+        Args:
+            row: dict，需包含 'input_patch'（np array 或 None）與 'reps'（list of np arrays）
+            save_path: 輸出路徑（含檔名）
+            n_repr: 最多顯示幾張代表圖，預設 4
+        """
+        input_patch = row.get("input_patch")
+        reps = row.get("reps") or []
+        n_cols = 1 + n_repr  # 第 0 格 input patch，後面 n_repr 格代表圖
+
+        fig, axes = plt.subplots(1, n_cols, figsize=(2.2 * n_cols, 2.4))
+        if n_cols == 1:
+            axes = np.array([axes])
+
+        # 第 0 格：input patch
+        if input_patch is not None:
+            axes[0].imshow(input_patch)
+        else:
+            axes[0].text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=9)
+        axes[0].set_title("input", fontsize=8)
+        axes[0].axis("off")
+
+        # 第 1~n_repr 格：代表圖
+        for i in range(n_repr):
+            ax = axes[1 + i]
+            if i < len(reps) and reps[i] is not None:
+                ax.imshow(reps[i])
+                ax.set_title(f"repr{i + 1}", fontsize=8)
+            ax.axis("off")
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
     def _make_stage3_summary_row(
         self, img, all_results, labels_by_checkpoint, top_item,
         trace_block="last", k_nearest=4
@@ -836,11 +934,20 @@ class ViTAnalyzer:
     def save_topk_trace_representative_pages(
         self, img, all_results, labels_by_checkpoint, gradcam_result,
         trace_dir, trace_block="last", k_nearest=4,
-        max_rows_per_fig=12, expansions_per_fig=2
+        max_rows_per_fig=12, expansions_per_fig=2,
+        save_single_rows=True,
     ):
         """
         每個 top-k patch 產生分頁 trace card。
         一個 expansion 不切頁；預設每頁 2 組 expansion，共 10 列。
+
+        若 save_single_rows=True，BFS 展開時同步把每個「input patch + repr」列
+        單獨存成一張 PNG 至 {trace_dir}/single_rows/，供 VLM 逐列分析。
+
+        single_rows 命名規則：
+          top-k 本身：  s{S}_b{B}_pos{P}_top{R}.png
+          子 patch：    s{S}_b{B}_pos{P}_parent_s{PS}p{PP}.png
+        其中 S=stage, B=block, P=pos, R=rank, PS=parent_stage, PP=parent_pos。
         """
         trace_dir = Path(trace_dir)
         trace_dir.mkdir(parents=True, exist_ok=True)
@@ -857,29 +964,65 @@ class ViTAnalyzer:
         max_fit = max(1, int(max_rows_per_fig) // max_expansion_rows)
         expansions_per_fig = max(1, min(int(expansions_per_fig), max_fit))
 
+        single_rows_dir = trace_dir / "single_rows"
+        if save_single_rows:
+            single_rows_dir.mkdir(parents=True, exist_ok=True)
+
+        def _save_sr_if_repr(row, stage, block_idx, pos, *, rank=None, parent_stage=None, parent_pos=None):
+            """若 row 是代表圖列（有 reps），存 single row 圖。展開列（child_patches）略過。"""
+            if not save_single_rows:
+                return
+            if "reps" not in row:
+                return  # 展開列，不存
+            if rank is not None:
+                fname = f"s{stage}_b{block_idx}_pos{pos}_top{rank:02d}.png"
+            else:
+                fname = f"s{stage}_b{block_idx}_pos{pos}_parent_s{parent_stage}p{parent_pos}.png"
+            self._save_single_row_image(row, single_rows_dir / fname, n_repr=k_nearest)
+
         for top_item in gradcam_result["top_positions"]:
             rank = int(top_item["rank"])
             top_pos = int(top_item["pos"])
-            queue = [(last_stage_idx, top_pos)]
-            pending_expansions = []
+            queue = [(last_stage_idx, top_pos, top_pos)]
             page = 1
 
+            # --- page 1：summary row + 第一個 expansion ---
             summary_row = self._make_stage3_summary_row(
                 img, all_results, labels_by_checkpoint, top_item,
                 trace_block=trace_block, k_nearest=k_nearest
             )
+
+            _last_block_indices = self._resolve_trace_block_indices(last_stage_idx, trace_block)
+            _last_block = _last_block_indices[0]
+            _save_sr_if_repr(summary_row, last_stage_idx, _last_block, top_pos, rank=rank)
+
             first_rows = [summary_row]
             if queue:
-                parent_stage, parent_pos = queue.pop(0)
+                parent_stage, parent_pos, _ = queue.pop(0)
                 rows, children = self._expansion_rows(
                     img, all_results, labels_by_checkpoint,
                     parent_stage, parent_pos,
                     trace_block=trace_block, k_nearest=k_nearest
                 )
                 first_rows.extend(rows)
+
+                # rows[0] 是展開列（child_patches），rows[1:] 才是子 patch 的代表圖列
+                child_stage = parent_stage - 1
+                _child_block_indices = self._resolve_trace_block_indices(child_stage, trace_block)
+                _child_block = _child_block_indices[0]
+                child_ptr = 0
+                for row in rows[1:]:
+                    if child_ptr < len(children):
+                        child_pos = int(children[child_ptr]["pos"])
+                        _save_sr_if_repr(
+                            row, child_stage, _child_block, child_pos,
+                            parent_stage=parent_stage, parent_pos=parent_pos,
+                        )
+                        child_ptr += 1
+
                 for child in children:
                     if child["stage"] > 0:
-                        queue.append((child["stage"], child["pos"]))
+                        queue.append((child["stage"], child["pos"], top_pos))
 
             self._save_trace_page(
                 first_rows,
@@ -889,21 +1032,37 @@ class ViTAnalyzer:
             )
             page += 1
 
+            # --- 後續 page：每次展開 expansions_per_fig 組 ---
             while queue:
                 pending_expansions = []
+
                 for _ in range(expansions_per_fig):
                     if not queue:
                         break
-                    parent_stage, parent_pos = queue.pop(0)
+                    parent_stage, parent_pos, _top_ancestor = queue.pop(0)
                     rows, children = self._expansion_rows(
                         img, all_results, labels_by_checkpoint,
                         parent_stage, parent_pos,
                         trace_block=trace_block, k_nearest=k_nearest
                     )
                     pending_expansions.extend(rows)
+
+                    child_stage = parent_stage - 1
+                    _child_block_indices = self._resolve_trace_block_indices(child_stage, trace_block)
+                    _child_block = _child_block_indices[0]
+                    child_ptr = 0
+                    for row in rows[1:]:
+                        if child_ptr < len(children):
+                            child_pos = int(children[child_ptr]["pos"])
+                            _save_sr_if_repr(
+                                row, child_stage, _child_block, child_pos,
+                                parent_stage=parent_stage, parent_pos=parent_pos,
+                            )
+                            child_ptr += 1
+
                     for child in children:
                         if child["stage"] > 0:
-                            queue.append((child["stage"], child["pos"]))
+                            queue.append((child["stage"], child["pos"], _top_ancestor))
 
                 if len(pending_expansions) > max_rows_per_fig:
                     print(
@@ -1713,7 +1872,8 @@ class ViTAnalyzer:
         mode="token", heads=None,
         gradcam_top_k=10, trace_block="last", save_gradcam_trace=True,
         trace_max_rows_per_fig=12, trace_expansions_per_fig=2,
-        save_all_inference_repr=False
+        save_all_inference_repr=False,
+        use_kmeans_cache=True, model_path=None,
     ):
         """
         對每個 stage、每個 block 做 K-means 分析並存代表圖。
@@ -1735,6 +1895,8 @@ class ViTAnalyzer:
             trace_max_rows_per_fig: trace representative page 每張最多列數
             trace_expansions_per_fig: trace representative page 每張最多放幾組 parent expansion
             save_all_inference_repr: 是否保留舊行為，存所有非 top-k position 的 repr 圖
+            use_kmeans_cache: 是否啟用 K-means 結果 cache，相同 model/dataset/n_clusters 時跳過重算
+            model_path: model checkpoint 路徑，用於 cache meta 比對，None 時 cache 永遠失效
         """
         if save_dir is None:
             save_dir = Path(__file__).resolve().parent / 'plots' / 'kmeans_all_stages_blocks'
@@ -1770,9 +1932,23 @@ class ViTAnalyzer:
                 patch_w = self.img_size // W
 
                 print(f"  對每個位置做 K-means...")
-                kmeans_dict, _ = self.run_kmeans_per_position(
-                    features, n_clusters=nc, positions=positions
-                )
+                # K-means cache 機制
+                cache_dir = save_dir / "kmeans_cache"
+                pkl_path, meta_path = self._kmeans_cache_path(cache_dir, stage_idx, block_idx, nc)
+                meta = self._kmeans_cache_meta(model_path, str(save_dir), stage_idx, block_idx, nc, max_samples)
+                kmeans_dict = None
+                if use_kmeans_cache:
+                    kmeans_dict = self._load_kmeans_cache(pkl_path, meta_path, meta)
+                    if kmeans_dict is not None:
+                        print(f"  ✓ 載入 K-means cache (stage{stage_idx}_block{block_idx}_nc{nc})")
+                if kmeans_dict is None:
+                    print(f"  對每個位置做 K-means...")
+                    kmeans_dict, _ = self.run_kmeans_per_position(
+                        features, n_clusters=nc, positions=positions
+                    )
+                    if use_kmeans_cache:
+                        self._save_kmeans_cache(kmeans_dict, pkl_path, meta_path, meta)
+                        print(f"  ✓ 已存 K-means cache (stage{stage_idx}_block{block_idx}_nc{nc})")
 
                 print(f"  取得各群聚的代表圖...")
                 representatives = self.get_representative_images_per_position(
@@ -1812,7 +1988,7 @@ class ViTAnalyzer:
                     save_gradcam_trace=save_gradcam_trace,
                     trace_max_rows_per_fig=trace_max_rows_per_fig,
                     trace_expansions_per_fig=trace_expansions_per_fig,
-                    save_all_inference_repr=save_all_inference_repr
+                    save_all_inference_repr=save_all_inference_repr,
                 )
             return all_results
 
@@ -2132,7 +2308,7 @@ def run_colored_mnist_analysis(
     return analyzer, result
 
 
-def run_colored_mnist_analysis_all(
+def run_dataset_analysis_all(
     model_path=None, dataset='Colored_MNIST', img_size=28, patch_size=1,
     max_samples=None, n_clusters=10, k_nearest=5, positions=None, save_dir=None,
     m_inference=None, inference_seed=42, clusters_per_fig=10,
@@ -2232,7 +2408,9 @@ def run_colored_mnist_analysis_all(
         save_gradcam_trace=save_gradcam_trace,
         trace_max_rows_per_fig=trace_max_rows_per_fig,
         trace_expansions_per_fig=trace_expansions_per_fig,
-        save_all_inference_repr=save_all_inference_repr
+        save_all_inference_repr=save_all_inference_repr,
+        use_kmeans_cache=True,
+        model_path=model_path
     )
 
 
@@ -2258,7 +2436,7 @@ if __name__ == "__main__":
 
     # 選項 B：每個 stage、每個 block、每個 pos 都存代表圖，並隨機取 m 張圖推論
     # cluster 數量依 config 的 kmeans_clusters_per_stage 設定
-    run_colored_mnist_analysis_all(
+    run_dataset_analysis_all(
         model_path=model_path,
         dataset=dataset,
         img_size=input_shape[0],
@@ -2269,7 +2447,7 @@ if __name__ == "__main__":
         clusters_per_fig=1,  # 每 10 個 cluster 一張圖
         positions=None,  # None=全部位置；可傳 [0,1,105] 等子集加速
         save_dir='plots/kmeans/Caltech101/',   # 預設 plots/kmeans_all_stages_blocks/
-        m_inference=5,   # 隨機取 m 張圖推論 cluster 指派並存檔
+        m_inference=10,   # 隨機取 m 張圖推論 cluster 指派並存檔
         inference_seed=42,
         save_cluster_representatives=False,  # 只存 inference 圖，不存每個 cluster 代表圖
         model_args=model_args,  # 從 config 傳入，含 merge_size 等
