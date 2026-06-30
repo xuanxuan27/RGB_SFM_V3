@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 import json
 import csv
+import random
 
 # 確保從專案根目錄 import（無論用 python Kmeans_analysis.py 或 python mergingViT_plot_tool/Kmeans_analysis.py）
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -245,10 +246,74 @@ def _validate_mergingvit_model_args(model_args=None, model_name=None):
         )
 
 
+def _normalize_label_mapping(label_mapping):
+    """把不同來源的 label metadata 統一成 dict[int, str]。"""
+    if not label_mapping:
+        return {}
+
+    if isinstance(label_mapping, dict):
+        normalized = {}
+        for key, value in label_mapping.items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            normalized[idx] = str(value)
+        return normalized
+
+    if isinstance(label_mapping, (list, tuple)):
+        return {idx: str(value) for idx, value in enumerate(label_mapping)}
+
+    return {}
+
+
+def _medmnist_label_names(dataset_name):
+    medmnist_flags = {
+        "PathMNIST": "pathmnist",
+        "PathMNIST_224": "pathmnist",
+        "DermaMNIST": "dermamnist",
+        "RetinaMNIST": "retinamnist",
+        "RetinaMNIST_224": "retinamnist",
+        "PreprocessedRetinaMNIST224": "retinamnist",
+        "BloodMNIST": "bloodmnist",
+    }
+    flag = medmnist_flags.get(dataset_name)
+    if flag is None:
+        return {}
+
+    try:
+        medmnist = __import__("medmnist", fromlist=["INFO"])
+        info = medmnist.INFO
+    except ImportError:
+        return {}
+
+    return _normalize_label_mapping(info[flag].get("label"))
+
+
+def _fallback_label_names(dataset_name):
+    fallback = {
+        "HeartCalcification_Color": {0: "Normal", 1: "Calcification"},
+        "HeartCalcification_Gray": {0: "Normal", 1: "Calcification"},
+        "CIFAR10": {
+            0: "airplane",
+            1: "automobile",
+            2: "bird",
+            3: "cat",
+            4: "deer",
+            5: "dog",
+            6: "frog",
+            7: "horse",
+            8: "ship",
+            9: "truck",
+        },
+    }
+    return dict(fallback.get(dataset_name, {}))
+
+
 class ViTAnalyzer:
     def __init__(
         self, model, dataloader, img_size=28, device='cuda',
-        display_mean=None, display_std=None
+        display_mean=None, display_std=None, dataset_name=None
     ):
         self.model = model.to(device).eval()
         self.dataloader = dataloader
@@ -256,7 +321,48 @@ class ViTAnalyzer:
         self.img_size = img_size
         self.display_mean = display_mean
         self.display_std = display_std
+        self.dataset_name = dataset_name
+        self.label_names = self._build_label_names()
         self.stage_resolutions = self._build_stage_resolutions()
+
+    def _build_label_names(self):
+        dataset = getattr(self.dataloader, "dataset", None)
+        seen = set()
+        candidates = []
+
+        while dataset is not None and id(dataset) not in seen:
+            seen.add(id(dataset))
+            candidates.append(dataset)
+            dataset = getattr(dataset, "dataset", None)
+
+        for candidate in candidates:
+            info = getattr(candidate, "info", None)
+            if isinstance(info, dict):
+                label_names = _normalize_label_mapping(info.get("label"))
+                if label_names:
+                    return label_names
+
+            label_to_idx = getattr(candidate, "label_to_idx", None)
+            if isinstance(label_to_idx, dict):
+                return {int(idx): str(name) for name, idx in label_to_idx.items()}
+
+            classes = getattr(candidate, "classes", None)
+            label_names = _normalize_label_mapping(classes)
+            if label_names:
+                return label_names
+
+        label_names = _medmnist_label_names(self.dataset_name)
+        if label_names:
+            return label_names
+
+        return _fallback_label_names(self.dataset_name)
+
+    def format_class_label(self, class_idx):
+        class_idx = int(class_idx)
+        name = self.label_names.get(class_idx)
+        if name is None or name == str(class_idx):
+            return str(class_idx)
+        return f"{class_idx} ({name})"
 
     def _build_stage_resolutions(self):
         """
@@ -423,6 +529,24 @@ class ViTAnalyzer:
                 })
 
         return children
+
+    def _parent_for_stage_position(self, stage_idx, pos):
+        """回傳指定 stage/position 在下一個 stage 的 parent；最後 stage 沒有 parent。"""
+        stage_idx = int(stage_idx)
+        pos = int(pos)
+        if stage_idx >= len(self.stage_resolutions) - 1:
+            return None
+
+        info = self.stage_resolutions[stage_idx]
+        if not info["has_merge"]:
+            return None
+
+        row = pos // info["W"]
+        col = pos % info["W"]
+        parent_row = row // info["m_h"]
+        parent_col = col // info["m_w"]
+        parent_pos = int(parent_row * info["next_W"] + parent_col)
+        return int(stage_idx + 1), parent_pos
 
     def trace_last_stage_positions(self, last_stage_positions):
         """
@@ -1502,7 +1626,8 @@ class ViTAnalyzer:
 
     def sample_random_images(self, m, seed=None):
         """
-        從整個 dataloader 均勻隨機取 m 張圖片（不依原始順序）。
+        從 dataloader.dataset 直接依 index 均勻隨機取 m 張圖片。
+        同一個 seed 會得到同一批 dataset index，不受 DataLoader shuffle 影響。
         
         Returns:
             images: [m, 3, H_img, W_img]
@@ -1511,30 +1636,47 @@ class ViTAnalyzer:
             return torch.empty((0, 3, self.img_size, self.img_size)), torch.empty((0,), dtype=torch.long)
 
         rng = np.random.default_rng(seed)
-        sampled = []   # (img, label)
-        seen = 0
-
-        for imgs, lbls in self.dataloader:
-            imgs_cpu = imgs.cpu()
-            # lbls 可能是 one-hot，統一轉成 argmax 整數
-            if lbls.dim() > 1:
-                lbls = lbls.argmax(dim=1)
-            lbls_cpu = lbls.cpu()
-            for i in range(imgs_cpu.shape[0]):
-                seen += 1
-                if len(sampled) < m:
-                    sampled.append((imgs_cpu[i], lbls_cpu[i]))
-                else:
-                    j = int(rng.integers(0, seen))
-                    if j < m:
-                        sampled[j] = (imgs_cpu[i], lbls_cpu[i])
-
-        if len(sampled) == 0:
+        dataset = getattr(self.dataloader, "dataset", None)
+        if dataset is None or len(dataset) == 0:
             return torch.empty((0, 3, self.img_size, self.img_size)), torch.empty((0,), dtype=torch.long)
 
-        perm = rng.permutation(len(sampled))
-        images = torch.stack([sampled[i][0] for i in perm], dim=0)
-        labels = torch.stack([sampled[i][1] for i in perm], dim=0)
+        n_pick = min(int(m), len(dataset))
+        indices = rng.choice(len(dataset), size=n_pick, replace=False).tolist()
+        sampled = []
+        for order, idx in enumerate(indices):
+            if seed is None:
+                img, lbl = dataset[int(idx)]
+            else:
+                item_seed = int(seed) + int(order)
+                py_state = random.getstate()
+                np_state = np.random.get_state()
+                random.seed(item_seed)
+                np.random.seed(item_seed % (2**32))
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(item_seed)
+                    img, lbl = dataset[int(idx)]
+                random.setstate(py_state)
+                np.random.set_state(np_state)
+
+            if not torch.is_tensor(img):
+                img = torch.as_tensor(np.asarray(img))
+            img = img.cpu()
+
+            if torch.is_tensor(lbl):
+                lbl_tensor = lbl.detach().cpu()
+                if lbl_tensor.dim() > 0 and lbl_tensor.numel() > 1:
+                    lbl_tensor = lbl_tensor.argmax()
+                else:
+                    lbl_tensor = lbl_tensor.reshape(-1)[0]
+                lbl_tensor = lbl_tensor.long()
+            else:
+                lbl_arr = np.asarray(lbl)
+                lbl_value = int(lbl_arr.argmax()) if lbl_arr.ndim > 0 and lbl_arr.size > 1 else int(lbl_arr)
+                lbl_tensor = torch.tensor(lbl_value, dtype=torch.long)
+            sampled.append((img, lbl_tensor))
+
+        images = torch.stack([item[0] for item in sampled], dim=0)
+        labels = torch.stack([item[1] for item in sampled], dim=0)
         return images, labels
 
     def extract_features_for_images(self, images, stage_idx, block_idx):
@@ -1866,6 +2008,19 @@ class ViTAnalyzer:
             'n_clusters': effective_n_clusters,
         }
 
+    @staticmethod
+    def _filter_last_block_per_stage(checkpoints):
+        """保留每個 stage 中 block index 最大的 checkpoint。"""
+        last_block_per_stage = {}
+        for stage_idx, block_idx in checkpoints:
+            if stage_idx not in last_block_per_stage or block_idx > last_block_per_stage[stage_idx]:
+                last_block_per_stage[stage_idx] = block_idx
+        return [
+            (stage_idx, block_idx)
+            for stage_idx, block_idx in checkpoints
+            if block_idx == last_block_per_stage[stage_idx]
+        ]
+
     def full_analysis_all_stages_blocks(
         self, max_samples=None, n_clusters=10, k_nearest=5,
         positions=None, save_dir=None,
@@ -1879,7 +2034,7 @@ class ViTAnalyzer:
         use_kmeans_cache=True, model_path=None,
     ):
         """
-        對每個 stage、每個 block 做 K-means 分析並存代表圖。
+        對每個 stage 的最後一個 block 做 K-means 分析並存代表圖。
         使用單次 forward 收集所有 checkpoint 特徵，避免重複計算。
         若指定 m_inference，會隨機取 m 張圖推論 cluster 指派並存檔。
 
@@ -1916,7 +2071,7 @@ class ViTAnalyzer:
                 max_samples=max_samples
             )
 
-            checkpoints = sorted(all_features.keys())
+            checkpoints = self._filter_last_block_per_stage(sorted(all_features.keys()))
             total_cp = len(checkpoints)
             for cp_idx, ((stage_idx, block_idx), (features, H, W)) in enumerate(
                 [(k, all_features[k]) for k in checkpoints]
@@ -2001,7 +2156,7 @@ class ViTAnalyzer:
             max_samples=max_samples
         )
 
-        checkpoints = sorted(all_head_features.keys())
+        checkpoints = self._filter_last_block_per_stage(sorted(all_head_features.keys()))
         total_cp = len(checkpoints)
         for cp_idx, ((stage_idx, block_idx), (features_heads, H, W)) in enumerate(
             [(k, all_head_features[k]) for k in checkpoints]
@@ -2128,9 +2283,8 @@ class ViTAnalyzer:
             # 顯示 GT 和 Pred 的 label 名稱
             gt = int(sample_gt_labels[img_idx].item())
             pred = int(sample_pred_labels[img_idx].item())
-            label_names = {0: "Normal", 1: "Calcification"}
-            gt_name = label_names.get(gt, str(gt))
-            pred_name = label_names.get(pred, str(pred))
+            gt_name = self.format_class_label(gt)
+            pred_name = self.format_class_label(pred)
             correct = (gt == pred)
             title_color = "lime" if correct else "red"
             title_str = f"GT: {gt_name}  |  Pred: {pred_name}"
@@ -2222,36 +2376,31 @@ class ViTAnalyzer:
     ):
         """
         對每個 position 顯示其被分到的 cluster 的代表圖，並各自單獨存檔。
-        格式：Pos X → Cluster Y | 原圖該 pos 的 patch | k 張 cluster 代表 patch。
+        輸出到 inference/all_pos_trace/img{idx}/，使用 GradCAM single_rows 的命名風格。
         """
-        n_cols = 1 + 1 + k_nearest  # 標籤 + 原圖 patch + 代表 patch
+        all_pos_dir = Path(inference_dir) / "all_pos_trace" / f"img{img_idx}"
+        all_pos_dir.mkdir(parents=True, exist_ok=True)
         positions = sorted(labels_single.keys())
 
         for pos in positions:
             cluster = labels_single[pos]
-            fig, axes = plt.subplots(1, n_cols, figsize=(2 * n_cols, 2.2))
-            if n_cols == 1:
-                axes = np.array([axes])
+            reps = representatives.get((pos, cluster), [])[:k_nearest]
+            row = {
+                "input_patch": self._stage_patch(img, stage_idx, pos),
+                "reps": reps,
+            }
 
-            axes[0].text(
-                0.5, 0.5, f'Pos {pos}\n→ Cluster {cluster}',
-                ha='center', va='center', fontsize=10
-            )
-            axes[0].axis('off')
-            orig_patch = self._stage_patch(img, stage_idx, pos)
-            axes[1].imshow(orig_patch)
-            axes[1].set_title('Input', fontsize=8)
-            axes[1].axis('off')
-            for i in range(k_nearest):
-                if (pos, cluster) in representatives and i < len(representatives[(pos, cluster)]):
-                    axes[2 + i].imshow(representatives[(pos, cluster)][i])
-                axes[2 + i].axis('off')
-
-            plt.suptitle(f'img{img_idx} s{stage_idx}_b{block_idx} repr pos{pos} cluster{cluster}')
-            plt.tight_layout()
-            save_path = inference_dir / f"img{img_idx}_s{stage_idx}_b{block_idx}_repr_pos{pos}_cluster{cluster}.png"
-            plt.savefig(save_path, dpi=150)
-            plt.close(fig)
+            parent = self._parent_for_stage_position(stage_idx, pos)
+            if parent is None:
+                # 與 GradCAM trace 的 root row 命名一致；只有最後 stage 會沒有 parent。
+                fname = f"s{stage_idx}_b{block_idx}_pos{pos}_top00.png"
+            else:
+                parent_stage, parent_pos = parent
+                fname = (
+                    f"s{stage_idx}_b{block_idx}_pos{pos}_"
+                    f"parent_s{parent_stage}p{parent_pos}.png"
+                )
+            self._save_single_row_image(row, all_pos_dir / fname, n_repr=k_nearest)
 
 
 def _infer_arch_from_checkpoint(state):
@@ -2313,7 +2462,8 @@ def run_colored_mnist_analysis(
     
     analyzer = ViTAnalyzer(
         model, analysis_loader, img_size=img_size,
-        display_mean=display_mean, display_std=display_std
+        display_mean=display_mean, display_std=display_std,
+        dataset_name=dataset
     )
     result = analyzer.full_analysis_pipeline(
         stage_idx=stage_idx, max_samples=max_samples,
@@ -2338,7 +2488,8 @@ def run_dataset_analysis_all(
     mode="token", heads=None, analysis_batch_size=32,
     model_name=None, gradcam_top_k=10, trace_block="last",
     save_gradcam_trace=True, trace_max_rows_per_fig=12,
-    trace_expansions_per_fig=2, save_all_inference_repr=False
+    trace_expansions_per_fig=2, save_all_inference_repr=False,
+    analysis_split="auto",
 ):
     """
     對每個 stage、每個 block、每個 position 存代表圖。
@@ -2350,6 +2501,8 @@ def run_dataset_analysis_all(
         model_args: 若提供（如從 config），用於建立模型；否則用 patch_size 等參數
         mode: "token" 或 "head"
         heads: mode="head" 時可指定 head 索引列表
+        analysis_split: "auto"、"train" 或 "test"。auto 保留舊邏輯：
+                        Caltech101 用 test，其餘資料集用 train。
     """
     import sys
     sys.path.insert(0, '.')
@@ -2361,7 +2514,13 @@ def run_dataset_analysis_all(
         dataset=dataset, root=_root, batch_size=analysis_batch_size,
         input_size=(img_size, img_size)
     )
-    analysis_loader = test_loader if dataset == 'Caltech101' else train_loader
+    split = (analysis_split or "auto").lower()
+    if split == "auto":
+        split = "test" if dataset == 'Caltech101' else "train"
+    if split not in {"train", "test"}:
+        raise ValueError(f"analysis_split 必須是 'auto'、'train' 或 'test'，目前收到: {analysis_split}")
+    analysis_loader = train_loader if split == "train" else test_loader
+    print(f"K-means analysis split: {split}")
     display_mean = IMAGENET_MEAN if dataset == 'Caltech101' else None
     display_std = IMAGENET_STD if dataset == 'Caltech101' else None
     
@@ -2409,7 +2568,8 @@ def run_dataset_analysis_all(
     
     analyzer = ViTAnalyzer(
         model, analysis_loader, img_size=img_size,
-        display_mean=display_mean, display_std=display_std
+        display_mean=display_mean, display_std=display_std,
+        dataset_name=dataset
     )
     return analyzer.full_analysis_all_stages_blocks(
         max_samples=max_samples,
@@ -2435,52 +2595,52 @@ def run_dataset_analysis_all(
     )
 
 
-if __name__ == "__main__":
-    import config as cfg
+# if __name__ == "__main__":
+#     import config as cfg
 
-    # 從 config 讀取設定
-    model_name = cfg.config["model"]["name"]
-    model_args = cfg.config["model"]["args"]
-    ckpt_dir = cfg.config.get("kmeans_checkpoint_dir") or cfg.config["save_dir"]
-    _validate_mergingvit_model_args(model_args=model_args, model_name=model_name)
-    model_path = str(Path(cfg.config["root"]) / ckpt_dir / f"{model_name}_best.pth")
-    dataset = cfg.config["dataset"]
-    input_shape = cfg.config["input_shape"]
-    clusters_list = cfg.config.get("kmeans_clusters_per_stage", [30, 60, 120, 240])
-    n_clusters_per_stage = {i: v for i, v in enumerate(clusters_list)}
+#     # 從 config 讀取設定
+#     model_name = cfg.config["model"]["name"]
+#     model_args = cfg.config["model"]["args"]
+#     ckpt_dir = cfg.config.get("kmeans_checkpoint_dir") or cfg.config["save_dir"]
+#     _validate_mergingvit_model_args(model_args=model_args, model_name=model_name)
+#     model_path = str(Path(cfg.config["root"]) / ckpt_dir / f"{model_name}_best.pth")
+#     dataset = cfg.config["dataset"]
+#     input_shape = cfg.config["input_shape"]
+#     clusters_list = cfg.config.get("kmeans_clusters_per_stage", [30, 60, 120, 240])
+#     n_clusters_per_stage = {i: v for i, v in enumerate(clusters_list)}
 
-    # 選項 A：單一 stage 分析（只畫中心位置）
-    # analyzer, result = run_colored_mnist_analysis(
-    #     model_path=model_path,
-    #     n_clusters=8, k_nearest=4, stage_idx=0
-    # )
+#     # 選項 A：單一 stage 分析（只畫中心位置）
+#     # analyzer, result = run_colored_mnist_analysis(
+#     #     model_path=model_path,
+#     #     n_clusters=8, k_nearest=4, stage_idx=0
+#     # )
 
-    # 選項 B：每個 stage、每個 block、每個 pos 都存代表圖，並隨機取 m 張圖推論
-    # cluster 數量依 config 的 kmeans_clusters_per_stage 設定
-    run_dataset_analysis_all(
-        model_path=model_path,
-        dataset=dataset,
-        img_size=input_shape[0],
-        patch_size=model_args.get("patch_size", 8),
-        max_samples=None,  # 可設 500 加速
-        n_clusters_per_stage=n_clusters_per_stage,
-        k_nearest=4,
-        clusters_per_fig=1,  # 每 10 個 cluster 一張圖
-        positions=None,  # None=全部位置；可傳 [0,1,105] 等子集加速
-        save_dir='plots/kmeans/Caltech101/',   # 預設 plots/kmeans_all_stages_blocks/
-        m_inference=10,   # 隨機取 m 張圖推論 cluster 指派並存檔
-        inference_seed=42,
-        save_cluster_representatives=False,  # 只存 inference 圖，不存每個 cluster 代表圖
-        model_args=model_args,  # 從 config 傳入，含 merge_size 等
-        data_root=str(Path(cfg.config["root"]) / "data"),
-        mode="token",
-        heads=None,
-        analysis_batch_size=cfg.config.get("batch_size", 4),
-        model_name=model_name,
-        gradcam_top_k=cfg.config.get("gradcam_trace_top_k", 5),
-        trace_block=cfg.config.get("gradcam_trace_block", "last"),
-        save_gradcam_trace=cfg.config.get("save_gradcam_trace", True),
-        trace_max_rows_per_fig=cfg.config.get("trace_max_rows_per_fig", 12),
-        trace_expansions_per_fig=cfg.config.get("trace_expansions_per_fig", 2),
-        save_all_inference_repr=cfg.config.get("save_all_inference_repr", False),
-    )
+#     # 選項 B：每個 stage、每個 block、每個 pos 都存代表圖，並隨機取 m 張圖推論
+#     # cluster 數量依 config 的 kmeans_clusters_per_stage 設定
+#     run_dataset_analysis_all(
+#         model_path=model_path,
+#         dataset=dataset,
+#         img_size=input_shape[0],
+#         patch_size=model_args.get("patch_size", 8),
+#         max_samples=None,  # 可設 500 加速
+#         n_clusters_per_stage=n_clusters_per_stage,
+#         k_nearest=4,
+#         clusters_per_fig=1,  # 每 10 個 cluster 一張圖
+#         positions=None,  # None=全部位置；可傳 [0,1,105] 等子集加速
+#         save_dir='plots/kmeans/Caltech101/',   # 預設 plots/kmeans_all_stages_blocks/
+#         m_inference=3,   # 隨機取 m 張圖推論 cluster 指派並存檔
+#         inference_seed=42,
+#         save_cluster_representatives=False,  # 只存 inference 圖，不存每個 cluster 代表圖
+#         model_args=model_args,  # 從 config 傳入，含 merge_size 等
+#         data_root=str(Path(cfg.config["root"]) / "data"),
+#         mode="token",
+#         heads=None,
+#         analysis_batch_size=cfg.config.get("batch_size", 4),
+#         model_name=model_name,
+#         gradcam_top_k=cfg.config.get("gradcam_trace_top_k", 5),
+#         trace_block=cfg.config.get("gradcam_trace_block", "last"),
+#         save_gradcam_trace=cfg.config.get("save_gradcam_trace", True),
+#         trace_max_rows_per_fig=cfg.config.get("trace_max_rows_per_fig", 12),
+#         trace_expansions_per_fig=cfg.config.get("trace_expansions_per_fig", 2),
+#         save_all_inference_repr=cfg.config.get("save_all_inference_repr", False),
+#     )

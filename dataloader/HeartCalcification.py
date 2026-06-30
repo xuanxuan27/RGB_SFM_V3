@@ -47,7 +47,7 @@ class HeartCalcificationDataset(Dataset):
         if not self.train:
             need_augmentation = False
             # 還原真實情況，不要做資料擴充
-            # use_min_count = False
+            use_min_count = False
 
 
         print(f"is train :{train}")
@@ -62,20 +62,16 @@ class HeartCalcificationDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[Any, Any]:
         key, img, label = self.model_ready_data[idx]
 
-        img = torch.from_numpy(img).float() / 255.0  # 将 np.ndarray 转换为张量
+        img = Image.fromarray(np.uint8(img)).convert(self.color_mode)
 
-        if self.color_mode == 'RGB':
-            if img.ndim == 3 and img.shape[-1] == 3:
-                img = img.permute(2, 0, 1)  # (H, W, 3) → (3, H, W)
-            elif img.ndim == 2:
-                img = img.unsqueeze(0).repeat(3, 1, 1)  # Grayscale to 3-channel
-            else:
-                raise ValueError(f"Unexpected image shape for RGB mode: {img.shape}")
+        if self.transform is not None:
+            img = self.transform(img)
         else:
-            # Assume grayscale: squeeze any channel dimension and make shape (1, H, W)
-            if img.ndim == 3 and img.shape[-1] == 1:
-                img = img.squeeze(-1)
-            img = img.unsqueeze(0)  # (H, W) → (1, H, W)
+            img = torch.from_numpy(np.array(img)).float() / 255.0
+            if self.color_mode == 'RGB':
+                img = img.permute(2, 0, 1)  # (H, W, 3) → (3, H, W)
+            else:
+                img = img.unsqueeze(0)  # (H, W) → (1, H, W)
 
 
         y_onehot = np.eye(2)[label]

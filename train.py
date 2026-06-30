@@ -18,6 +18,25 @@ from loss.loss_function import get_loss_function, MetricBaseLoss
 from models.RGB_SFMCNN_V2 import get_feature_extraction_layers, get_basic_target_layers
 from monitor.monitor_method import get_all_layers_stats
 
+def print_multiclass_metrics(targets, preds, num_classes=None):
+    from sklearn.metrics import (confusion_matrix, accuracy_score,
+                                 precision_score, recall_score, f1_score,
+                                 balanced_accuracy_score)
+    targets = np.asarray(targets)
+    preds   = np.asarray(preds)
+
+    acc  = accuracy_score(targets, preds)
+    prec = precision_score(targets, preds, average='macro', zero_division=0)
+    rec  = recall_score(targets, preds, average='macro', zero_division=0)
+    f1   = f1_score(targets, preds, average='macro', zero_division=0)
+    bal  = balanced_accuracy_score(targets, preds)
+
+    print("\nMetrics (macro-average):")
+    print(f"Accuracy      : {acc:.4f}")
+    print(f"Precision     : {prec:.4f}")
+    print(f"Recall        : {rec:.4f}")
+    print(f"F1-score      : {f1:.4f}")
+    print(f"Balanced Acc. : {bal:.4f}\n")
 
 def print_binary_metrics(targets, preds):
     targets = np.asarray(targets)
@@ -283,7 +302,12 @@ def eval(dataloader: DataLoader, model: nn.Module, loss_fn, need_table=True, dev
             test_acc = correct/size
             progress.set_description("Loss: {:.7f}, Accuracy: {:.7f}".format(test_loss, test_acc))
     if print_metrics:
-        print_binary_metrics(all_targets, all_preds)
+        if config['confusion_matrix'] == "binary":
+            print_binary_metrics(all_targets, all_preds)
+        elif config['confusion_matrix'] == "multiclass":
+            model_args = config['model']['args']
+            num_classes = model_args.get('num_classes', model_args.get('out_channels'))
+            print_multiclass_metrics(all_targets, all_preds, num_classes=num_classes)
     return test_acc, test_loss, table
 
 config['save_dir'] = increment_path(config['save_dir'], exist_ok = False)

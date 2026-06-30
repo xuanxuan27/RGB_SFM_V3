@@ -181,24 +181,33 @@ def discover_inference_repr_images(plots_root: Path) -> list[PlotRecord]:
 
 def discover_single_row_images(plots_root: Path) -> list[PlotRecord]:
     """
-    掃描 {plots_root}/single_rows/ 內的 single-row PNG。
+    掃描 single-row PNG。
+    支援兩種目錄形態：
+      1) {plots_root}/single_rows/*.png（GradCAM trace）
+      2) {plots_root}/*.png（例如 inference/vlm_analysis/img{N}）
 
     支援兩種命名格式：
       top-k patch 本身：  s{S}_b{B}_pos{P}_top{R}.png
       子 patch：          s{S}_b{B}_pos{P}_parent_s{PS}p{PP}.png
     """
-    single_rows_dir = Path(plots_root).resolve() / "single_rows"
-    if not single_rows_dir.is_dir():
-        raise FileNotFoundError(f"找不到 single_rows 目錄: {single_rows_dir}")
+    root = Path(plots_root).resolve()
+    if (root / "single_rows").is_dir():
+        image_dir = root / "single_rows"
+        rel_prefix = "single_rows/"
+    elif root.is_dir():
+        image_dir = root
+        rel_prefix = ""
+    else:
+        raise FileNotFoundError(f"找不到圖片目錄: {root}")
 
     records: list[PlotRecord] = []
-    for png in sorted(single_rows_dir.glob("*.png")):
+    for png in sorted(image_dir.glob("*.png")):
         name = png.name
 
         m = SINGLE_ROW_TOP_PATTERN.match(name)
         if m:
             stage, block, pos, rank = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-            rel = f"single_rows/s{stage}_b{block}_pos{pos}_top{rank:02d}"
+            rel = f"{rel_prefix}s{stage}_b{block}_pos{pos}_top{rank:02d}"
             records.append(PlotRecord(
                 image_path=str(png),
                 stage=stage,
@@ -218,7 +227,7 @@ def discover_single_row_images(plots_root: Path) -> list[PlotRecord]:
         if m:
             stage, block, pos = int(m.group(1)), int(m.group(2)), int(m.group(3))
             parent_stage, parent_pos = int(m.group(4)), int(m.group(5))
-            rel = f"single_rows/s{stage}_b{block}_pos{pos}_parent_s{parent_stage}p{parent_pos}"
+            rel = f"{rel_prefix}s{stage}_b{block}_pos{pos}_parent_s{parent_stage}p{parent_pos}"
             records.append(PlotRecord(
                 image_path=str(png),
                 stage=stage,
@@ -247,6 +256,57 @@ def discover_single_row_images(plots_root: Path) -> list[PlotRecord]:
     ))
     return records
 
+
+def discover_gradcam_trace_single_row_images(plots_root: Path) -> list[PlotRecord]:
+    """
+    掃描 GradCAM trace 輸出的 single-row PNG。
+
+    支援：
+      1) {plots_root}/img{N}/single_rows/*.png
+      2) {plots_root}/single_rows/*.png
+      3) {plots_root} 若本身就是 img{N} 或 single_rows 目錄
+    """
+    root = Path(plots_root).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"找不到圖片目錄: {root}")
+
+    img_dir_pattern = re.compile(r"^img(\d+)$", re.IGNORECASE)
+
+    if root.name == "single_rows":
+        candidate_roots = [root.parent]
+    elif (root / "single_rows").is_dir():
+        candidate_roots = [root]
+    else:
+        candidate_roots = [
+            p for p in sorted(root.glob("img*"))
+            if p.is_dir() and img_dir_pattern.match(p.name) and (p / "single_rows").is_dir()
+        ]
+
+    records: list[PlotRecord] = []
+    for candidate in candidate_roots:
+        root_records = discover_single_row_images(candidate)
+        match = img_dir_pattern.match(candidate.name)
+        if match:
+            img_idx = int(match.group(1))
+            for rec in root_records:
+                rec.img = img_idx
+                rec.rel_key = f"{candidate.name}/{rec.rel_key}"
+        records.extend(root_records)
+
+    records.sort(
+        key=lambda r: (
+            r.img if r.img is not None else -1,
+            r.stage,
+            r.block,
+            r.top_rank if r.top_rank is not None else 999,
+            r.parent_stage if r.parent_stage is not None else -1,
+            r.parent_pos if r.parent_pos is not None else -1,
+            r.pos if r.pos is not None else -1,
+            r.image_path,
+        )
+    )
+    return records
+
 # ---------------------------------------------------------------------------
 # Prompt
 # ---------------------------------------------------------------------------
@@ -264,20 +324,53 @@ def build_default_prompt() -> str:
         "請用繁體中文回答。"
     )
 
-def build_single_row_prompt() -> str:
-    return (
-        "這張圖包含一列影像區塊（patch）。\n"
-        "最左邊第一格是從某張圖片的特定空間位置裁出的輸入 patch；"
-        "右側四格是與它歸屬於同一個 K-means cluster 的代表樣本，"
-        "代表了模型在這個位置學習到的典型視覺特徵。\n\n"
-        "請依以下面向分析這五張 patch 的共同視覺特徵：\n"
-        "1. 顏色與對比：主要色調、亮暗分布、前景背景關係\n"
-        "2. 形狀與結構：幾何特徵、紋理方向、邊緣特性\n"
-        "3. 位置線索：視覺特徵集中在 patch 的哪個區域（上/下/左/右/中）\n"
-        "4. 跨樣本一致性：五張 patch 之間相似在哪、差異在哪\n\n"
-        "最後用一句話總結：這個位置的 cluster 最可能在捕捉圖像中的什麼局部視覺結構。\n"
-        "請用繁體中文回答。"
-    )
+def normalize_dataset_name(dataset: str | None) -> str:
+    """將 dataset 名稱轉成 prompt 分支使用的穩定 key。"""
+    if not dataset:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", dataset.lower())
+
+
+def build_single_row_prompt(dataset: str | None = None, stage: int | None = None) -> str:
+    dataset_key = normalize_dataset_name(dataset)
+
+    if dataset_key == "bloodmnist":
+        if stage in (0, 1, 2):
+            return (
+                "【任務背景與角色】你現在是一個深度學習特徵空間（Latent Space）分析師。目前正在分析 MergingViT 網路在低階層（Stage 0 到 Stage 2，影像高度像素化，僅有色塊與初步梯度）的特徵分群結果。【影像結構說明】本次輸入的圖片包含 5 個區塊：input：當前待推論的未知局部影像區塊（Patch）。repr1 到 repr4：該特徵群聚中心（Cluster Center）附近的 4 個代表性影像區塊（Prototypes）。【請依序執行以下群聚特徵分析】群聚視覺共性分析：觀察 repr1 到 repr4，這四個代表圖有什麼共同的色彩組合（如：深紫、藍紫、淡粉、灰藍、橘紅或乳白背景）？這四個代表圖在亮暗分佈或邊界梯度上（例如：左暗右亮、呈 L 型深色轉角、或是平滑純色），有什麼共通的視覺規律？待推論物件（input）與群聚的對比：比較 input 與 repr1~repr4。input 是否完美符合上述觀察到的群聚共性？其色彩和局部梯度與代表圖們是否一致？底層特徵解讀：綜合上述，這個特徵群聚中心在低階層中，主要是在捕捉細胞的哪種底層特徵？（例如：「主要捕捉深色細胞核與淡色質的邊緣轉角」或「主要捕捉純背景與質的交界」）。"
+            )
+        else: 
+            return (
+                "【任務背景與角色】你現在是一個專業的臨床血液學 AI 專家，正在分析 MergingViT 在高階層（Stage 3，16x16 像素，具備高階語意邊緣與局部結構）的特徵分群結果。【影像結構說明】本次輸入的圖片包含 5 個區塊：input：當前待推論的未知局部影像區塊。repr1 到 repr4：該特徵群聚中心附近的 4 個代表性影像區塊。它們共同定義了這個群聚的醫學形態學意義。【已知 8 種血細胞的局部形態學關鍵依據】Basophil: 密集深紫色大顆粒。Eosinophil: 雙葉核邊緣或大型橘紅色顆粒。Erythroblast: 圓形且染色質極度緻密（深黑色）的核邊緣，質偏藍。Immature Granulocyte: 局部核邊緣呈較鬆散的圓弧、或不規則腎形/馬蹄形折角。Lymphocyte: 極高核質比。局部幾乎全被巨大圓核（深色）佔據，邊緣僅帶有些微藍紫色細胞質。Monocyte: 豐富灰藍色細胞質，或可見摺疊不規則的腎形核邊緣。Neutrophil: 可見明顯的分葉核塊（細長核橋或多個獨立深色核），細胞質淡粉色。Platelet: 體積極小，呈現無核、不規則碎片狀。【請依序執行以下高階語意辨識】高階形態學共性分析：觀察 repr1 到 repr4，這四個代表圖共同展現了什麼細胞局部結構？（例如：皆呈現大半圓形的核邊緣、皆為分葉狀的核轉折、或是皆充滿某種特定顏色的細胞質？）。待推論物件（input）的比對：input 的細胞核弧度、細胞質顏色或顆粒感，是否與 repr1~repr4 的結構特徵高度契合？群聚類別與血球推論：結合 input 與 repr 展現的視覺證據，這個群聚中心最符合上述 8 種血細胞中哪一種的局部特徵？請給出 Top-1（最可能） 與 Top-2（次可能） 的預測，並詳細說明理由（例如：「代表圖與 input 皆展現出細長的分葉核結構與淡粉色質，判定此群聚為 Neutrophil 的特徵區域」）。"
+            )
+    elif dataset_key == "caltech101":
+        return (
+            "【任務背景與角色】\n"
+            "你現在是一個計算機視覺與深度學習特徵空間（Latent Space）分析師。目前正在分析 MergingViT 網路在 Caltech 101 物體分類資料集中的特徵分群結果。\n"
+            "【影像結構說明】\n"
+            "本次輸入的圖片包含 5 個區塊：input：當前待推論的未知局部影像區塊（Patch）。repr1 到 repr4：該特徵群聚中心附近的 4 個代表性影像區塊。它們共同定義了這個特徵群聚的局部視覺概念。\n"
+            "【重要：請依據目前影像的清晰度（Stage）進行動態分析】\n"
+            "步驟一：多尺度視覺共性分析\n"
+            "（觀察 repr1 到 repr4）如果影像極度像素化/呈粗糙色塊（低階層 Stage 0-2）：請著重描述代表圖之間共同的「色彩組合」、「亮暗梯度分佈（例如：左暗右亮、橫向帶狀明暗）」以及「是否有特定方向的色彩邊界」。如果影像細節清晰/具備具體形狀（高階層 Stage 3）：請著重描述其共同展現的「人工製品局部結構（如：整齊窗戶、輪胎弧度、金屬線條）」或「自然物體紋理（如：毛髮、葉片）」，並注意其背景環境。\n"
+            "步驟二：待推論物件（input）的契合度比對\n"
+            "對比 input 與 repr1~repr4。無論在「色塊梯度（Stage 0-2）」還是「結構幾何（Stage 3）」上，input 是否都完美契合並融入了這個特徵群聚中心？請指出它們最一致的視覺特徵。\n"
+            "步驟三：群聚語意與潛在物體類別推論\n"
+            "結合上述視覺證據，嘗試推測這個特徵群聚最可能是在捕捉 Caltech 101 中哪一種常見物體的局部？請給出 Top-1（最可能） 與 Top-2（次可能） 的預測，並詳細說明理由。(備註：若目前影像屬於 Stage 0-2 且幾何特徵太模糊，請主要依據「色彩與梯度搭配（如：上方藍天色、下方金屬色）」進行類別聯想，並在理由中說明這是基於低階特徵的推測。)\n"
+        )
+    else:    
+        return (
+            "這張圖包含一列影像區塊（patch）。\n"
+            "最左邊第一格是從某張圖片的特定空間位置裁出的輸入 patch；"
+            "右側四格是與它歸屬於同一個 K-means cluster 的代表樣本，"
+            "代表了模型在這個位置學習到的典型視覺特徵。\n\n"
+            "請依以下面向分析這五張 patch 的共同視覺特徵：\n"
+            "1. 顏色與對比：主要色調、亮暗分布、前景背景關係\n"
+            "2. 形狀與結構：幾何特徵、紋理方向、邊緣特性\n"
+            "3. 位置線索：視覺特徵集中在 patch 的哪個區域（上/下/左/右/中）\n"
+            "4. 跨樣本一致性：五張 patch 之間相似在哪、差異在哪\n\n"
+            "最後用一句話總結：這個位置的 cluster 最可能在捕捉圖像中的什麼局部視覺結構。\n"
+            "請用繁體中文回答。"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -944,12 +1037,12 @@ def parse_args() -> argparse.Namespace:
             "圖片根目錄。\n"
             "  scan-mode=repr: 內含 stage{S}_block{B}/repr_pos{P}_part{K}.png\n"
             "  scan-mode=inference: 內含 img{I}_s{S}_b{B}.png\n"
-            "  scan-mode=single-row: 內含 single_rows/*.png（trace 推論結果目錄）"
+            "  scan-mode=single-row: 內含 single_rows/*.png，或目錄本身直接放 s*_b*_pos*.png"
         ),
     )
     p.add_argument(
         "--scan-mode",
-        choices=("repr", "inference", "inference-repr-pos"),
+        choices=("repr", "inference", "inference-repr-pos", "single-row", "gradcam-trace"),
         default="repr",
         help=(
             "掃描模式：\n"
@@ -957,7 +1050,9 @@ def parse_args() -> argparse.Namespace:
             "  inference: img{I}_s{S}_b{B}.png\n"
             "  inference-repr-pos: img{I}_s{S}_b{B}_repr_pos{P}_cluster{C}.png\n"
             "  single-row: {plots_root}/single_rows/s{S}_b{B}_pos{P}_top{R}.png\n"
-            "              {plots_root}/single_rows/s{S}_b{B}_pos{P}_parent_s{PS}p{PP}.png"
+            "              {plots_root}/single_rows/s{S}_b{B}_pos{P}_parent_s{PS}p{PP}.png\n"
+            "              或 {plots_root}/s{S}_b{B}_pos{P}_parent_s{PS}p{PP}.png\n"
+            "  gradcam-trace: {plots_root}/img{I}/single_rows/*.png"
         ),
     )
     p.add_argument(
@@ -1002,6 +1097,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="自訂 prompt 文字檔（UTF-8），若未指定則用內建繁中說明",
+    )
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="dataset 名稱，用於選擇內建 prompt（例如 BloodMNIST）；未指定時使用通用 prompt",
     )
     p.add_argument(
         "--skip-existing",
@@ -1118,6 +1219,8 @@ def main() -> None:
         records = discover_inference_stage_images(args.plots_root)
     elif args.scan_mode == "inference-repr-pos":
         records = discover_inference_repr_images(args.plots_root)
+    elif args.scan_mode == "gradcam-trace":
+        records = discover_gradcam_trace_single_row_images(args.plots_root)
     else:  # single-row
         records = discover_single_row_images(args.plots_root)
     records = filter_and_sort_records_by_stage(
@@ -1128,8 +1231,11 @@ def main() -> None:
 
     if args.prompt_file is not None:
         prompt = args.prompt_file.read_text(encoding="utf-8").strip()
-    elif args.scan_mode == "single-row":
-        prompt = build_single_row_prompt()
+    elif args.scan_mode in ("single-row", "gradcam-trace"):
+        prompt = build_single_row_prompt(
+            args.dataset,
+            stage=records[0].stage if records else None,
+        )
     else:
         prompt = build_default_prompt()
 
@@ -1138,6 +1244,7 @@ def main() -> None:
     if args.dry_run:
         print(f"plots_root  = {args.plots_root.resolve()}")
         print(f"scan_mode   = {args.scan_mode}")
+        print(f"dataset     = {args.dataset or '(generic)'}")
         print(f"model       = {args.model}  （family: {family}）")
         print(
             f"stage 範圍  : {args.stage_start} -> {args.stage_end}（含）"
@@ -1154,6 +1261,8 @@ def main() -> None:
             pattern_hint = "img*_s*_b*.png"
         elif args.scan_mode == "inference-repr-pos":
             pattern_hint = "img*_s*_b*_repr_pos*_cluster*.png"
+        elif args.scan_mode == "gradcam-trace":
+            pattern_hint = "img*/single_rows/s*_b*_pos*_top*.png 或 img*/single_rows/s*_b*_pos*_parent_s*p*.png"
         else:  # single-row
             pattern_hint = "single_rows/s*_b*_pos*_top*.png 或 single_rows/s*_b*_pos*_parent_s*p*.png"
         print(
@@ -1200,13 +1309,18 @@ def main() -> None:
                     print(f"[{i+1}/{len(stage_records)}] 略過（已存在） {rec.rel_key}")
                     continue
                 print(f"[{i+1}/{len(stage_records)}] {rec.rel_key} …", flush=True)
+                rec_prompt = (
+                    prompt
+                    if args.prompt_file is not None or args.scan_mode not in ("single-row", "gradcam-trace")
+                    else build_single_row_prompt(args.dataset, stage=rec.stage)
+                )
                 try:
                     text = caption_one_image(
                         processor=processor,
                         model=model,
                         model_family=model_family,
                         image_path=rec.image_path,
-                        prompt=prompt,
+                        prompt=rec_prompt,
                         max_new_tokens=args.max_new_tokens,
                     )
                 except Exception as e:
@@ -1216,7 +1330,8 @@ def main() -> None:
                 row = {
                     **asdict(rec),
                     "caption": text,
-                    "prompt": prompt,
+                    "prompt": rec_prompt,
+                    "dataset": args.dataset,
                     "model": args.model,
                     "model_family": model_family,
                     "max_new_tokens": args.max_new_tokens,
