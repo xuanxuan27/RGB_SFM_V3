@@ -66,7 +66,7 @@ def run_step_kmeans(cfg: dict) -> Path:
     執行 K-means 分析，含 single_rows 存圖與 K-means cache。
     回傳 gradcam_trace 根目錄路徑。
     """
-    from mergingViT_plot_tool.Kmeans_analysis import run_dataset_analysis_all
+    from mergingViT_plot_tool.Kmeans_analysis_padding_repr import run_dataset_analysis_all
 
     project_root = Path(cfg["root"])
     ckpt_dir     = cfg.get("kmeans_checkpoint_dir") or cfg["save_dir"]
