@@ -185,8 +185,11 @@ class TransformerBlock(nn.Module):
 
 class MergingViT(nn.Module):
     def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=10, 
-                 embed_dims=[64, 128, 256, 512], depths=[1, 1, 1, 1], merge_size=2, drop_rate=0.1, drop_path_rate=0.1):
+                 embed_dims=[64, 128, 256, 512], num_heads=[2, 4, 8, 16], depths=[1, 1, 1, 1], merge_size=2, drop_rate=0.1, drop_path_rate=0.1):
         super().__init__()
+        assert len(num_heads) == len(depths), "num_heads 長度需與 stage 數一致"
+        for d, nh in zip(embed_dims, num_heads):
+            assert d % nh == 0, f"embed_dim {d} 無法被 num_heads {nh} 整除"
         
         # 1. 初始 Patch Embedding (通常第一層切較大，如 4x4)
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dims[0])
@@ -228,7 +231,7 @@ class MergingViT(nn.Module):
             
             # B. 建立當前 Stage 的 Transformer Blocks（ViT: drop 用於 attn、proj、mlp）
             stage_blocks = nn.ModuleList([
-                TransformerBlock(dim=embed_dims[i], drop=drop_rate,
+                TransformerBlock(dim=embed_dims[i], num_heads=num_heads[i], drop=drop_rate,
                 drop_path=dp_rates[block_idx + j]) for j in range(depths[i])
             ])
             block_idx += depths[i]

@@ -4,8 +4,9 @@
 將每張 cluster 代表圖的敘述另存為 JSONL。
 
 支援模型：
-  - Qwen2-VL 系列  （預設：Qwen/Qwen2-VL-7B-Instruct）
-  - InternVL2 系列  （例如：OpenGVLab/InternVL2-8B）
+  - Qwen2.5-VL 系列  （預設：Qwen/Qwen2.5-VL-7B-Instruct）
+  - Qwen2-VL 系列    （例如：Qwen/Qwen2-VL-7B-Instruct）
+  - InternVL2 系列   （例如：OpenGVLab/InternVL2-8B）
 
 用法（專案根目錄）:
   python vit_analysis_vlm/run_caption_analysis.py
@@ -307,20 +308,135 @@ def discover_gradcam_trace_single_row_images(plots_root: Path) -> list[PlotRecor
     )
     return records
 
+def discover_experiment_single_row_images(plots_root: Path) -> list[PlotRecord]:
+    """
+    掃描 experiment 資料夾中的 single-row PNG。
+
+    支援：
+      1) {plots_root}/{dataset}/img{N}/*.png
+      2) {plots_root}/img{N}/*.png（若直接指向某 dataset）
+      3) {plots_root} 若本身就是 img{N} 目錄
+
+    命名格式同 single-row：
+      top-k：  s{S}_b{B}_pos{P}_top{R}.png
+      子 patch：s{S}_b{B}_pos{P}_parent_s{PS}p{PP}.png
+    """
+    root = Path(plots_root).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"找不到圖片目錄: {root}")
+
+    img_dir_pattern = re.compile(r"^img(\d+)$", re.IGNORECASE)
+
+    # (rel_prefix, img_idx, image_dir)
+    candidates: list[tuple[str, int | None, Path]] = []
+
+    if img_dir_pattern.match(root.name):
+        img_idx = int(img_dir_pattern.match(root.name).group(1))
+        candidates.append(("", img_idx, root))
+    else:
+        direct_imgs = [
+            p for p in sorted(root.glob("img*"))
+            if p.is_dir() and img_dir_pattern.match(p.name)
+        ]
+        if direct_imgs:
+            for p in direct_imgs:
+                img_idx = int(img_dir_pattern.match(p.name).group(1))
+                candidates.append((f"{p.name}/", img_idx, p))
+        else:
+            for dataset_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+                for p in sorted(dataset_dir.glob("img*")):
+                    if not (p.is_dir() and img_dir_pattern.match(p.name)):
+                        continue
+                    img_idx = int(img_dir_pattern.match(p.name).group(1))
+                    candidates.append(
+                        (f"{dataset_dir.name}/{p.name}/", img_idx, p)
+                    )
+
+    records: list[PlotRecord] = []
+    for rel_prefix, img_idx, image_dir in candidates:
+        for png in sorted(image_dir.glob("*.png")):
+            name = png.name
+
+            m = SINGLE_ROW_TOP_PATTERN.match(name)
+            if m:
+                stage, block, pos, rank = (
+                    int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                )
+                rel = f"{rel_prefix}s{stage}_b{block}_pos{pos}_top{rank:02d}"
+                records.append(PlotRecord(
+                    image_path=str(png),
+                    stage=stage,
+                    block=block,
+                    pos=pos,
+                    part=None,
+                    img=img_idx,
+                    cluster=None,
+                    rel_key=rel,
+                    parent_stage=None,
+                    parent_pos=None,
+                    top_rank=rank,
+                ))
+                continue
+
+            m = SINGLE_ROW_CHILD_PATTERN.match(name)
+            if m:
+                stage, block, pos = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                parent_stage, parent_pos = int(m.group(4)), int(m.group(5))
+                rel = (
+                    f"{rel_prefix}s{stage}_b{block}_pos{pos}"
+                    f"_parent_s{parent_stage}p{parent_pos}"
+                )
+                records.append(PlotRecord(
+                    image_path=str(png),
+                    stage=stage,
+                    block=block,
+                    pos=pos,
+                    part=None,
+                    img=img_idx,
+                    cluster=None,
+                    rel_key=rel,
+                    parent_stage=parent_stage,
+                    parent_pos=parent_pos,
+                    top_rank=None,
+                ))
+                continue
+            # 命名格式不符，略過
+
+    records.sort(key=lambda r: (
+        r.rel_key.split("/")[0] if "/" in r.rel_key else "",
+        r.img if r.img is not None else -1,
+        r.stage,
+        r.block,
+        r.top_rank if r.top_rank is not None else 999,
+        r.parent_stage if r.parent_stage is not None else -1,
+        r.parent_pos if r.parent_pos is not None else -1,
+        r.pos if r.pos is not None else -1,
+        r.image_path,
+    ))
+    return records
+
 # ---------------------------------------------------------------------------
 # Prompt
 # ---------------------------------------------------------------------------
 
 def build_default_prompt() -> str:
     return (
-        "這張圖包含多張來自同一個 K-means cluster 的 image patch，"
-        "這些 patch 是從 ViT attention 特徵空間中聚類後，最接近群心的代表樣本。\n\n"
-        "請依以下幾個面向分析這些 patch 的共同視覺特徵：\n"
-        "1. 顏色與對比：主要色調、前景背景關係\n"
-        "2. 形狀與結構：幾何特徵、筆畫方向、邊緣特性\n"
-        "3. 位置線索：特徵集中在 patch 的哪個區域（上/下/左/右/中）\n"
-        "4. 跨樣本一致性：這幾張 patch 之間相似在哪、差異在哪\n\n"
-        "最後用一句話總結：這個 cluster 最可能在捕捉圖像中的什麼局部視覺結構。\n"
+        "這張圖包含一列影像區塊（patch）。\n"
+        "最左邊第一格是從某張圖片的特定空間位置裁出的輸入樣本；"
+        "右側四格是與它歸屬於同一個 K-means cluster 的代表樣本，"
+        "代表了模型在這個位置學習到的典型視覺特徵。\n\n"
+        "請依以下面向分析這五張 patch 的共同視覺特徵：\n"
+        "1. 顏色與對比：主要色調、亮暗分布、前景背景關係\n"
+        "2. 形狀與結構：幾何特徵、紋理方向、邊緣特性\n"
+        "3. 位置線索：視覺特徵集中在 patch 的哪個區域（上/下/左/右/中）\n"
+        "4. 具體特徵：具體的顏色、方向、位置、形狀、筆畫、結構、物件 \n"
+        "5. 跨樣本一致性：五張 patch 之間相似在哪、差異在哪\n\n"
+        "最後，請用一句話具體總結這個位置的 cluster 最可能捕捉的局部視覺結構。"
+        "請避免使用空泛詞彙（例如『局部視覺特徵』『邊緣特徵』『視覺結構』等籠統說法），"
+        "並依照以下句型填空作答（將方括號替換為具體判斷，不要保留方括號）：\n"
+        "此位置的 cluster 主要捕捉 [具體位置] 處 [顏色] 形成的 [具體形狀]。"
+        "輸入樣本與代表樣本相比，於上述特徵上呈現「[契合程度：高度吻合／部分吻合／明顯偏離]」，"
+        "具體而言，[說明契合或偏離之處，同樣具有什麼樣的顏色、方向、位置、形狀、筆畫、結構、物件，或是具體差異]。\n\n"
         "請用繁體中文回答。"
     )
 
@@ -360,15 +476,21 @@ def build_single_row_prompt(dataset: str | None = None, stage: int | None = None
     else:    
         return (
             "這張圖包含一列影像區塊（patch）。\n"
-            "最左邊第一格是從某張圖片的特定空間位置裁出的輸入 patch；"
+            "最左邊第一格是從某張圖片的特定空間位置裁出的輸入樣本；"
             "右側四格是與它歸屬於同一個 K-means cluster 的代表樣本，"
             "代表了模型在這個位置學習到的典型視覺特徵。\n\n"
             "請依以下面向分析這五張 patch 的共同視覺特徵：\n"
             "1. 顏色與對比：主要色調、亮暗分布、前景背景關係\n"
             "2. 形狀與結構：幾何特徵、紋理方向、邊緣特性\n"
             "3. 位置線索：視覺特徵集中在 patch 的哪個區域（上/下/左/右/中）\n"
-            "4. 跨樣本一致性：五張 patch 之間相似在哪、差異在哪\n\n"
-            "最後用一句話總結：這個位置的 cluster 最可能在捕捉圖像中的什麼局部視覺結構。\n"
+            "4. 具體特徵：具體的顏色、方向、位置、形狀、筆畫、結構、物件 \n"
+            "5. 跨樣本一致性：五張 patch 之間相似在哪、差異在哪\n\n"
+            "最後，請用一句話具體總結這個位置的 cluster 最可能捕捉的局部視覺結構。"
+            "請避免使用空泛詞彙（例如『局部視覺特徵』『邊緣特徵』『視覺結構』等籠統說法），"
+            "並依照以下句型填空作答（將方括號替換為具體判斷，不要保留方括號）：\n"
+            "此位置的 cluster 主要捕捉 [具體位置] 處 [顏色] 形成的 [具體形狀]。"
+            "輸入樣本與代表樣本相比，於上述特徵上呈現「[契合程度：高度吻合／部分吻合／明顯偏離]」，"
+            "具體而言，[說明契合或偏離之處，同樣具有什麼樣的顏色、方向、位置、形狀、筆畫、結構、物件，或是具體差異]。\n\n"
             "請用繁體中文回答。"
         )
 
@@ -385,14 +507,17 @@ def _model_primary_device(model: torch.nn.Module) -> torch.device:
 
 
 def detect_model_family(model_id: str) -> str:
-    """根據 model id 判斷模型系列。回傳 'qwen2vl' 或 'internvl'。"""
-    lower = model_id.lower()
+    """根據 model id 判斷模型系列。回傳 'qwen25vl' | 'qwen2vl' | 'internvl'。"""
+    lower = model_id.lower().replace("_", "-")
     if "internvl" in lower:
         return "internvl"
+    # 必須先判斷 2.5，避免被舊版 qwen2-vl 規則誤傷
+    if "qwen2.5-vl" in lower or "qwen25-vl" in lower or "qwen2.5vl" in lower:
+        return "qwen25vl"
     if "qwen2-vl" in lower or "qwen2vl" in lower:
         return "qwen2vl"
-    # 預設嘗試 qwen2vl
-    return "qwen2vl"
+    # 預設改走 Qwen2.5-VL
+    return "qwen25vl"
 
 
 # ---------------------------------------------------------------------------
@@ -878,11 +1003,17 @@ def load_model(
         )
         return tokenizer, model, family
 
-    else:  # qwen2vl
-        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-        print(f"  偵測到 Qwen2-VL 系列，使用 Qwen2VLForConditionalGeneration")
+    else:  # qwen25vl / qwen2vl
+        from transformers import AutoProcessor
+
+        if family == "qwen25vl":
+            from transformers import Qwen2_5_VLForConditionalGeneration as _QwenVLCls
+            print("  偵測到 Qwen2.5-VL 系列，使用 Qwen2_5_VLForConditionalGeneration")
+        else:
+            from transformers import Qwen2VLForConditionalGeneration as _QwenVLCls
+            print("  偵測到 Qwen2-VL 系列，使用 Qwen2VLForConditionalGeneration")
         processor = AutoProcessor.from_pretrained(model_id)
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
+        model = _QwenVLCls.from_pretrained(
             model_id,
             torch_dtype="auto",
             device_map="auto",
@@ -923,9 +1054,9 @@ def _load_image_for_internvl(image_path: str, input_size: int = 448) -> "torch.T
 
 def caption_one_image(
     *,
-    processor,          # AutoProcessor（Qwen2-VL）或 AutoTokenizer（InternVL）
+    processor,          # AutoProcessor（Qwen2/2.5-VL）或 AutoTokenizer（InternVL）
     model,
-    model_family: str,  # 'qwen2vl' | 'internvl'
+    model_family: str,  # 'qwen25vl' | 'qwen2vl' | 'internvl'
     image_path: str,    # 本機絕對路徑（非 URI）
     prompt: str,
     max_new_tokens: int,
@@ -940,7 +1071,7 @@ def caption_one_image(
             max_new_tokens=max_new_tokens,
         )
     else:
-        return _caption_qwen2vl(
+        return _caption_qwen_vl(
             processor=processor,
             model=model,
             image_path=image_path,
@@ -949,7 +1080,7 @@ def caption_one_image(
         )
 
 
-def _caption_qwen2vl(
+def _caption_qwen_vl(
     *,
     processor,
     model,
@@ -979,7 +1110,7 @@ def _caption_qwen2vl(
         videos=video_inputs,
         padding=True,
         return_tensors="pt",
-    ).to(model.device)
+    ).to(_model_primary_device(model))
 
     with torch.inference_mode():
         generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
@@ -992,6 +1123,10 @@ def _caption_qwen2vl(
         trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
     return out[0].strip() if out else ""
+
+
+# 相容舊名稱
+_caption_qwen2vl = _caption_qwen_vl
 
 
 def _internvl_pixel_dtype(model: torch.nn.Module) -> torch.dtype:
@@ -1028,7 +1163,7 @@ def _caption_internvl(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="對 cluster 代表圖批次跑 VLM 敘述（支援 Qwen2-VL / InternVL2）")
+    p = argparse.ArgumentParser(description="對 cluster 代表圖批次跑 VLM 敘述（支援 Qwen2.5-VL / Qwen2-VL / InternVL2）")
     p.add_argument(
         "--plots-root",
         type=Path,
@@ -1037,12 +1172,20 @@ def parse_args() -> argparse.Namespace:
             "圖片根目錄。\n"
             "  scan-mode=repr: 內含 stage{S}_block{B}/repr_pos{P}_part{K}.png\n"
             "  scan-mode=inference: 內含 img{I}_s{S}_b{B}.png\n"
-            "  scan-mode=single-row: 內含 single_rows/*.png，或目錄本身直接放 s*_b*_pos*.png"
+            "  scan-mode=single-row: 內含 single_rows/*.png，或目錄本身直接放 s*_b*_pos*.png\n"
+            "  scan-mode=experiment: 內含 {dataset}/img{I}/*.png（例如 plots/kmeans/experiment）"
         ),
     )
     p.add_argument(
         "--scan-mode",
-        choices=("repr", "inference", "inference-repr-pos", "single-row", "gradcam-trace"),
+        choices=(
+            "repr",
+            "inference",
+            "inference-repr-pos",
+            "single-row",
+            "gradcam-trace",
+            "experiment",
+        ),
         default="repr",
         help=(
             "掃描模式：\n"
@@ -1052,7 +1195,8 @@ def parse_args() -> argparse.Namespace:
             "  single-row: {plots_root}/single_rows/s{S}_b{B}_pos{P}_top{R}.png\n"
             "              {plots_root}/single_rows/s{S}_b{B}_pos{P}_parent_s{PS}p{PP}.png\n"
             "              或 {plots_root}/s{S}_b{B}_pos{P}_parent_s{PS}p{PP}.png\n"
-            "  gradcam-trace: {plots_root}/img{I}/single_rows/*.png"
+            "  gradcam-trace: {plots_root}/img{I}/single_rows/*.png\n"
+            "  experiment: {plots_root}/{dataset}/img{I}/s{S}_b{B}_pos{P}_*.png"
         ),
     )
     p.add_argument(
@@ -1066,17 +1210,19 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="captions_stage{stage}.jsonl",
         help=(
-            "輸出檔名樣板，可用欄位：{stage} {img} {block} {pos} {part} {cluster}。\n"
-            "範例（每張圖每個 stage 一檔）: captions_img{img}_stage{stage}.jsonl"
+            "輸出檔名樣板，可用欄位：{stage} {img} {block} {pos} {part} {cluster} {dataset}。\n"
+            "範例（每張圖每個 stage 一檔）: captions_img{img}_stage{stage}.jsonl\n"
+            "範例（experiment）: {dataset}/captions_img{img}_stage{stage}.jsonl"
         ),
     )
     p.add_argument(
         "--model",
         type=str,
-        default="Qwen/Qwen2-VL-7B-Instruct",
+        default="Qwen/Qwen2.5-VL-7B-Instruct",
         help=(
             "Hugging Face 模型 id 或本機路徑。\n"
-            "  Qwen2-VL 系列：Qwen/Qwen2-VL-7B-Instruct（預設）\n"
+            "  Qwen2.5-VL 系列：Qwen/Qwen2.5-VL-7B-Instruct（預設）\n"
+            "  Qwen2-VL 系列：Qwen/Qwen2-VL-7B-Instruct\n"
             "  InternVL2 系列：OpenGVLab/InternVL2-8B"
         ),
     )
@@ -1183,7 +1329,7 @@ def filter_and_sort_records_by_stage(
     return out
 
 
-def render_output_relpath(template: str, rec: PlotRecord) -> str:
+def render_output_relpath(template: str, rec: PlotRecord, dataset: str | None = None) -> str:
     """依 record 套用 output template。"""
     data: dict[str, Any] = {
         "stage": rec.stage,
@@ -1192,25 +1338,42 @@ def render_output_relpath(template: str, rec: PlotRecord) -> str:
         "pos": rec.pos if rec.pos is not None else -1,
         "part": rec.part if rec.part is not None else -1,
         "cluster": rec.cluster if rec.cluster is not None else -1,
+        "dataset": dataset if dataset else "unknown",
     }
     try:
         return template.format(**data)
     except KeyError as e:
         raise ValueError(
             f"--output-template 使用了未知欄位 {e!s}，可用欄位: "
-            "{stage} {img} {block} {pos} {part} {cluster}"
+            "{stage} {img} {block} {pos} {part} {cluster} {dataset}"
         ) from e
+
+
+def resolve_record_dataset(rec: PlotRecord, fallback: str | None, scan_mode: str) -> str | None:
+    """優先用 CLI --dataset；experiment 模式可從 rel_key 第一層資料夾推斷。"""
+    if fallback:
+        return fallback
+    if scan_mode == "experiment" and "/" in rec.rel_key:
+        return rec.rel_key.split("/", 1)[0]
+    return None
 
 
 # ---------------------------------------------------------------------------
 # 主程式
 # ---------------------------------------------------------------------------
 
+_SINGLE_ROW_SCAN_MODES = ("single-row", "gradcam-trace", "experiment")
+
+
 def main() -> None:
     args = parse_args()
-    if not any(tok in args.output_template for tok in ("{stage}", "{img}", "{block}", "{pos}", "{part}", "{cluster}")):
+    if not any(
+        tok in args.output_template
+        for tok in ("{stage}", "{img}", "{block}", "{pos}", "{part}", "{cluster}", "{dataset}")
+    ):
         raise ValueError(
-            "--output-template 至少要包含一個欄位：{stage} {img} {block} {pos} {part} {cluster}"
+            "--output-template 至少要包含一個欄位："
+            "{stage} {img} {block} {pos} {part} {cluster} {dataset}"
         )
 
     if args.scan_mode == "repr":
@@ -1221,6 +1384,8 @@ def main() -> None:
         records = discover_inference_repr_images(args.plots_root)
     elif args.scan_mode == "gradcam-trace":
         records = discover_gradcam_trace_single_row_images(args.plots_root)
+    elif args.scan_mode == "experiment":
+        records = discover_experiment_single_row_images(args.plots_root)
     else:  # single-row
         records = discover_single_row_images(args.plots_root)
     records = filter_and_sort_records_by_stage(
@@ -1231,9 +1396,14 @@ def main() -> None:
 
     if args.prompt_file is not None:
         prompt = args.prompt_file.read_text(encoding="utf-8").strip()
-    elif args.scan_mode in ("single-row", "gradcam-trace"):
+    elif args.scan_mode in _SINGLE_ROW_SCAN_MODES:
+        first_ds = (
+            resolve_record_dataset(records[0], args.dataset, args.scan_mode)
+            if records
+            else args.dataset
+        )
         prompt = build_single_row_prompt(
-            args.dataset,
+            first_ds,
             stage=records[0].stage if records else None,
         )
     else:
@@ -1244,7 +1414,7 @@ def main() -> None:
     if args.dry_run:
         print(f"plots_root  = {args.plots_root.resolve()}")
         print(f"scan_mode   = {args.scan_mode}")
-        print(f"dataset     = {args.dataset or '(generic)'}")
+        print(f"dataset     = {args.dataset or '(from path / generic)'}")
         print(f"model       = {args.model}  （family: {family}）")
         print(
             f"stage 範圍  : {args.stage_start} -> {args.stage_end}（含）"
@@ -1263,6 +1433,8 @@ def main() -> None:
             pattern_hint = "img*_s*_b*_repr_pos*_cluster*.png"
         elif args.scan_mode == "gradcam-trace":
             pattern_hint = "img*/single_rows/s*_b*_pos*_top*.png 或 img*/single_rows/s*_b*_pos*_parent_s*p*.png"
+        elif args.scan_mode == "experiment":
+            pattern_hint = "{dataset}/img*/s*_b*_pos*_top*.png 或 {dataset}/img*/s*_b*_pos*_parent_s*p*.png"
         else:  # single-row
             pattern_hint = "single_rows/s*_b*_pos*_top*.png 或 single_rows/s*_b*_pos*_parent_s*p*.png"
         print(
@@ -1281,7 +1453,8 @@ def main() -> None:
 
     out_to_records: dict[Path, list[PlotRecord]] = {}
     for rec in records:
-        rel_out = render_output_relpath(args.output_template, rec)
+        rec_dataset = resolve_record_dataset(rec, args.dataset, args.scan_mode)
+        rel_out = render_output_relpath(args.output_template, rec, dataset=rec_dataset)
         out_path = args.output_dir / rel_out
         out_to_records.setdefault(out_path, []).append(rec)
 
@@ -1309,10 +1482,11 @@ def main() -> None:
                     print(f"[{i+1}/{len(stage_records)}] 略過（已存在） {rec.rel_key}")
                     continue
                 print(f"[{i+1}/{len(stage_records)}] {rec.rel_key} …", flush=True)
+                rec_dataset = resolve_record_dataset(rec, args.dataset, args.scan_mode)
                 rec_prompt = (
                     prompt
-                    if args.prompt_file is not None or args.scan_mode not in ("single-row", "gradcam-trace")
-                    else build_single_row_prompt(args.dataset, stage=rec.stage)
+                    if args.prompt_file is not None or args.scan_mode not in _SINGLE_ROW_SCAN_MODES
+                    else build_single_row_prompt(rec_dataset, stage=rec.stage)
                 )
                 try:
                     text = caption_one_image(
@@ -1331,7 +1505,7 @@ def main() -> None:
                     **asdict(rec),
                     "caption": text,
                     "prompt": rec_prompt,
-                    "dataset": args.dataset,
+                    "dataset": rec_dataset,
                     "model": args.model,
                     "model_family": model_family,
                     "max_new_tokens": args.max_new_tokens,

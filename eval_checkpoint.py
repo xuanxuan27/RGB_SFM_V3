@@ -21,7 +21,7 @@ from dataloader import get_dataloader
 from loss.loss_function import get_loss_function
 
 # ─── 設定這裡 ────────────────────────────────────────────
-EXP_DIR = "runs/train/exp106"
+EXP_DIR = "runs/train/exp330"
 # ─────────────────────────────────────────────────────────
 
 

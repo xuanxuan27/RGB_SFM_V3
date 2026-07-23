@@ -1,0 +1,49 @@
+# dataset=Caltech101 exp_id=exp330 clusters_per_stage=[32, 64, 128, 256]
+# save_dir=/home/xuan/RGB_SFM_V3/plots/kmeans/scalable/caltech101/exp330/nc32_64_128_256
+============================================================
+K-means: Caltech101 / exp330
+model_path : /home/xuan/RGB_SFM_V3/runs/train/exp330/MergingViT_best.pth
+save_dir   : /home/xuan/RGB_SFM_V3/plots/kmeans/scalable/caltech101/exp330/nc32_64_128_256
+stages nc  : [32, 64, 128, 256]
+============================================================
+K-means analysis split: train
+Inference sampling split: test
+已載入模型: /home/xuan/RGB_SFM_V3/runs/train/exp330/MergingViT_best.pth
+=== 單次 forward 收集所有 (stage, block) 特徵 ===
+單次 forward 共有 6907 張圖片
+stage0_block0: torch.Size([6907, 784, 32]) (H=28, W=28)
+stage1_block0: torch.Size([6907, 196, 64]) (H=14, W=14)
+stage2_block0: torch.Size([6907, 49, 128]) (H=7, W=7)
+stage3_block0: torch.Size([6907, 16, 256]) (H=4, W=4)
+=== Stage 0 Block 0 [總進度 25% (1/4)] (K-means, n_clusters=32) ===
+對每個位置做 K-means...
+對每個位置做 K-means...
+✓ 已存 K-means cache (stage0_block0_nc32)
+取得各群聚的代表圖...
+略過 stage/block 的 cluster 代表圖儲存（save_cluster_representatives=False）
+=== Stage 1 Block 0 [總進度 50% (2/4)] (K-means, n_clusters=64) ===
+對每個位置做 K-means...
+對每個位置做 K-means...
+✓ 已存 K-means cache (stage1_block0_nc64)
+取得各群聚的代表圖...
+略過 stage/block 的 cluster 代表圖儲存（save_cluster_representatives=False）
+=== Stage 2 Block 0 [總進度 75% (3/4)] (K-means, n_clusters=128) ===
+對每個位置做 K-means...
+對每個位置做 K-means...
+✓ 已存 K-means cache (stage2_block0_nc128)
+取得各群聚的代表圖...
+略過 stage/block 的 cluster 代表圖儲存（save_cluster_representatives=False）
+=== Stage 3 Block 0 [總進度 100% (4/4)] (K-means, n_clusters=256) ===
+對每個位置做 K-means...
+對每個位置做 K-means...
+✓ 已存 K-means cache (stage3_block0_nc256)
+取得各群聚的代表圖...
+略過 stage/block 的 cluster 代表圖儲存（save_cluster_representatives=False）
+=== 隨機取 2 張圖推論 cluster 指派 ===
+推論進度: 圖 1/2 (50%)
+已存 img0 的 GradCAM top-5 回溯 cluster JSON
+已存 img0 的原始圖與 cluster 指派圖、GradCAM top-k trace 圖、所有 position 代表圖
+推論進度: 圖 2/2 (100%)
+已存 img1 的 GradCAM top-5 回溯 cluster JSON
+已存 img1 的原始圖與 cluster 指派圖、GradCAM top-k trace 圖、所有 position 代表圖
+# returncode=0 elapsed_min=16.5

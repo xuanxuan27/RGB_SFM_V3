@@ -120,7 +120,8 @@ def run_step_kmeans(cfg: dict) -> Path:
         trace_max_rows_per_fig=cfg.get("trace_max_rows_per_fig", 12),
         trace_expansions_per_fig=cfg.get("trace_expansions_per_fig", 2),
         save_all_inference_repr=cfg.get("save_all_inference_repr", False),
-        analysis_split=cfg.get("kmeans_dataset_split", "auto"),
+        analysis_split="train",
+        inference_split="test",
     )
 
     gradcam_trace_dir = Path(save_dir) / "inference" / "gradcam_trace"

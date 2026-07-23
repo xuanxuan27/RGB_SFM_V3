@@ -1,0 +1,205 @@
+# dataset=Colored_FashionMNIST num_classes=30 input_shape=(28, 28) patch_size=2 batch_size=256
+# save_dir=runs/train/exp326
+# best_acc=0.9142 test_acc=0.9142 precision=0.9142 recall=0.9141 f1=0.9139 balanced_acc=0.9141
+# returncode=0 elapsed_min=23.5
+# ===== FINAL SUMMARY =====
+Train: 
+	Accuracy: 0.98455, Avg loss: 0.0427118725577771 
+Valid: 
+	Accuracy: 0.9142, Avg loss: 0.42938005967293974 
+Metrics (macro-average):
+Accuracy      : 0.9129
+Precision     : 0.9126
+Recall        : 0.9128
+F1-score      : 0.9123
+Balanced Acc. : 0.9128
+Test 1: 
+	Accuracy: 0.9129, Avg loss: 0.49850497718444337 
+Metrics (macro-average):
+Accuracy      : 0.9142
+Precision     : 0.9142
+Recall        : 0.9141
+F1-score      : 0.9139
+Balanced Acc. : 0.9141
+Test 2: 
+	Accuracy: 0.9142, Avg loss: 0.42938005967293974 
+checkpoint keys: dict_keys(['model_weights', 'optimizer', 'scheduler', 'train_loss', 'train_acc', 'valid_loss', 'valid_acc', 'best_epoch'])
+# ===== END SUMMARY =====
+
+runs/train/exp
+save_dir: runs/train/exp326
+wandb: ⭐️ View project at https://wandb.ai/xuanxuan27-national-central-university/paper%20experiment
+wandb: 🚀 View run at https://wandb.ai/xuanxuan27-national-central-university/paper%20experiment/runs/69b27d8g
+<class 'dataloader.Colored_FashionMNIST.Colored_FashionMNIST'>
+MergingViT(
+  (patch_embed): PatchEmbed(
+    (proj): Conv2d(3, 32, kernel_size=(2, 2), stride=(2, 2))
+    (norm): LayerNorm((32,), eps=1e-05, elementwise_affine=True)
+  )
+  (stages): ModuleList(
+    (0): ModuleList(
+      (0): TransformerBlock(
+        (norm1): LayerNorm((32,), eps=1e-05, elementwise_affine=True)
+        (attn): Attention(
+          (qkv): Linear(in_features=32, out_features=96, bias=False)
+          (attn_drop): Dropout(p=0.1, inplace=False)
+          (proj): Linear(in_features=32, out_features=32, bias=True)
+          (proj_drop): Dropout(p=0.1, inplace=False)
+        )
+        (norm2): LayerNorm((32,), eps=1e-05, elementwise_affine=True)
+        (mlp): Mlp(
+          (fc1): Linear(in_features=32, out_features=128, bias=True)
+          (act): GELU(approximate='none')
+          (fc2): Linear(in_features=128, out_features=32, bias=True)
+          (drop): Dropout(p=0.1, inplace=False)
+        )
+        (drop_path): Identity()
+      )
+    )
+    (1): ModuleList(
+      (0): TransformerBlock(
+        (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+        (attn): Attention(
+          (qkv): Linear(in_features=64, out_features=192, bias=False)
+          (attn_drop): Dropout(p=0.1, inplace=False)
+          (proj): Linear(in_features=64, out_features=64, bias=True)
+          (proj_drop): Dropout(p=0.1, inplace=False)
+        )
+        (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+        (mlp): Mlp(
+          (fc1): Linear(in_features=64, out_features=256, bias=True)
+          (act): GELU(approximate='none')
+          (fc2): Linear(in_features=256, out_features=64, bias=True)
+          (drop): Dropout(p=0.1, inplace=False)
+        )
+        (drop_path): DropPath(drop_prob=0.100)
+      )
+    )
+    (2): ModuleList(
+      (0): TransformerBlock(
+        (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (attn): Attention(
+          (qkv): Linear(in_features=128, out_features=384, bias=False)
+          (attn_drop): Dropout(p=0.1, inplace=False)
+          (proj): Linear(in_features=128, out_features=128, bias=True)
+          (proj_drop): Dropout(p=0.1, inplace=False)
+        )
+        (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (mlp): Mlp(
+          (fc1): Linear(in_features=128, out_features=512, bias=True)
+          (act): GELU(approximate='none')
+          (fc2): Linear(in_features=512, out_features=128, bias=True)
+          (drop): Dropout(p=0.1, inplace=False)
+        )
+        (drop_path): DropPath(drop_prob=0.200)
+      )
+    )
+    (3): ModuleList(
+      (0): TransformerBlock(
+        (norm1): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+        (attn): Attention(
+          (qkv): Linear(in_features=256, out_features=768, bias=False)
+          (attn_drop): Dropout(p=0.1, inplace=False)
+          (proj): Linear(in_features=256, out_features=256, bias=True)
+          (proj_drop): Dropout(p=0.1, inplace=False)
+        )
+        (norm2): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+        (mlp): Mlp(
+          (fc1): Linear(in_features=256, out_features=1024, bias=True)
+          (act): GELU(approximate='none')
+          (fc2): Linear(in_features=1024, out_features=256, bias=True)
+          (drop): Dropout(p=0.1, inplace=False)
+        )
+        (drop_path): DropPath(drop_prob=0.300)
+      )
+    )
+  )
+  (pos_embeds): ParameterList(
+      (0): Parameter containing: [torch.float32 of size 1x196x32 (cuda:0)]
+      (1): Parameter containing: [torch.float32 of size 1x49x64 (cuda:0)]
+      (2): Parameter containing: [torch.float32 of size 1x16x128 (cuda:0)]
+      (3): Parameter containing: [torch.float32 of size 1x4x256 (cuda:0)]
+  )
+  (merges): ModuleList(
+    (0): FlexiblePatchMerging(
+      (reduction): Linear(in_features=128, out_features=64, bias=True)
+      (norm): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+    )
+    (1): FlexiblePatchMerging(
+      (reduction): Linear(in_features=256, out_features=128, bias=True)
+      (norm): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+    )
+    (2): FlexiblePatchMerging(
+      (reduction): Linear(in_features=512, out_features=256, bias=True)
+      (norm): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+    )
+    (3): Identity()
+  )
+  (norm_final): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+  (head_drop): Dropout(p=0.1, inplace=False)
+  (head): Linear(in_features=256, out_features=30, bias=True)
+)
+✓ Best epoch: 0, val_acc: 0.8071
+✓ Best epoch: 1, val_acc: 0.8314
+✓ Best epoch: 2, val_acc: 0.8461
+✓ Best epoch: 3, val_acc: 0.8566
+✓ Best epoch: 5, val_acc: 0.8673
+✓ Best epoch: 6, val_acc: 0.8718
+✓ Best epoch: 7, val_acc: 0.8753
+✓ Best epoch: 9, val_acc: 0.8819
+✓ Best epoch: 12, val_acc: 0.8875
+✓ Best epoch: 13, val_acc: 0.8880
+✓ Best epoch: 14, val_acc: 0.8913
+✓ Best epoch: 15, val_acc: 0.8941
+✓ Best epoch: 17, val_acc: 0.8961
+✓ Best epoch: 18, val_acc: 0.8975
+✓ Best epoch: 20, val_acc: 0.8976
+✓ Best epoch: 21, val_acc: 0.8990
+✓ Best epoch: 23, val_acc: 0.9019
+✓ Best epoch: 25, val_acc: 0.9038
+✓ Best epoch: 27, val_acc: 0.9039
+✓ Best epoch: 28, val_acc: 0.9056
+✓ Best epoch: 39, val_acc: 0.9064
+✓ Best epoch: 44, val_acc: 0.9066
+✓ Best epoch: 46, val_acc: 0.9107
+✓ Best epoch: 71, val_acc: 0.9115
+✓ Best epoch: 72, val_acc: 0.9134
+✓ Best epoch: 73, val_acc: 0.9142
+Early stopping at epoch 103
+Train: 
+	Accuracy: 0.98455, Avg loss: 0.0427118725577771 
+Valid: 
+	Accuracy: 0.9142, Avg loss: 0.42938005967293974 
+Metrics (macro-average):
+Accuracy      : 0.9129
+Precision     : 0.9126
+Recall        : 0.9128
+F1-score      : 0.9123
+Balanced Acc. : 0.9128
+Test 1: 
+	Accuracy: 0.9129, Avg loss: 0.49850497718444337 
+Metrics (macro-average):
+Accuracy      : 0.9142
+Precision     : 0.9142
+Recall        : 0.9141
+F1-score      : 0.9139
+Balanced Acc. : 0.9141
+Test 2: 
+	Accuracy: 0.9142, Avg loss: 0.42938005967293974 
+checkpoint keys: dict_keys(['model_weights', 'optimizer', 'scheduler', 'train_loss', 'train_acc', 'valid_loss', 'valid_acc', 'best_epoch'])
+wandb:                                                                                
+wandb: 
+wandb: Run summary:
+wandb:  final_test_accuracy 0.9142
+wandb:  final_test_avg_loss 0.42938
+wandb: final_train_accuracy 0.98455
+wandb: final_train_avg_loss 0.04271
+wandb:       train/accuracy 0.99212
+wandb:          train/epoch 103
+wandb:      train/learnrate 7e-05
+wandb:           train/loss 0.02279
+wandb:       valid/accuracy 0.9129
+wandb:           valid/loss 0.4985
+wandb: 
+wandb: 🚀 View run HierarchicalViT_Colored_FashionMNIST at: https://wandb.ai/xuanxuan27-national-central-university/paper%20experiment/runs/69b27d8g
+wandb: ⭐️ View project at: https://wandb.ai/xuanxuan27-national-central-university/paper%20experiment

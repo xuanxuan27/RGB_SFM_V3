@@ -312,6 +312,7 @@ def eval(dataloader: DataLoader, model: nn.Module, loss_fn, need_table=True, dev
 
 config['save_dir'] = increment_path(config['save_dir'], exist_ok = False)
 Path(config['save_dir']).mkdir(parents=True, exist_ok=True)
+print(f"save_dir: {config['save_dir']}")
 
 # start a new wandb run to track this script
 wandb.init(

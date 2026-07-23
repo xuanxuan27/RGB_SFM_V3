@@ -218,6 +218,7 @@ _MERGING_VIT_ALLOWED_ARGS = {
     "in_chans",
     "num_classes",
     "embed_dims",
+    "num_heads",
     "depths",
     "merge_size",
     "drop_rate",
@@ -313,10 +314,14 @@ def _fallback_label_names(dataset_name):
 class ViTAnalyzer:
     def __init__(
         self, model, dataloader, img_size=28, device='cuda',
-        display_mean=None, display_std=None, dataset_name=None
+        display_mean=None, display_std=None, dataset_name=None,
+        inference_dataloader=None,
     ):
         self.model = model.to(device).eval()
         self.dataloader = dataloader
+        self.inference_dataloader = (
+            inference_dataloader if inference_dataloader is not None else dataloader
+        )
         self.device = device
         self.img_size = img_size
         self.display_mean = display_mean
@@ -1626,7 +1631,7 @@ class ViTAnalyzer:
 
     def sample_random_images(self, m, seed=None):
         """
-        從 dataloader.dataset 直接依 index 均勻隨機取 m 張圖片。
+        從 inference dataloader.dataset 直接依 index 均勻隨機取 m 張圖片。
         同一個 seed 會得到同一批 dataset index，不受 DataLoader shuffle 影響。
         
         Returns:
@@ -1636,7 +1641,7 @@ class ViTAnalyzer:
             return torch.empty((0, 3, self.img_size, self.img_size)), torch.empty((0,), dtype=torch.long)
 
         rng = np.random.default_rng(seed)
-        dataset = getattr(self.dataloader, "dataset", None)
+        dataset = getattr(self.inference_dataloader, "dataset", None)
         if dataset is None or len(dataset) == 0:
             return torch.empty((0, 3, self.img_size, self.img_size)), torch.empty((0,), dtype=torch.long)
 
@@ -2490,6 +2495,7 @@ def run_dataset_analysis_all(
     save_gradcam_trace=True, trace_max_rows_per_fig=12,
     trace_expansions_per_fig=2, save_all_inference_repr=False,
     analysis_split="auto",
+    inference_split="test",
 ):
     """
     對每個 stage、每個 block、每個 position 存代表圖。
@@ -2501,8 +2507,10 @@ def run_dataset_analysis_all(
         model_args: 若提供（如從 config），用於建立模型；否則用 patch_size 等參數
         mode: "token" 或 "head"
         heads: mode="head" 時可指定 head 索引列表
-        analysis_split: "auto"、"train" 或 "test"。auto 保留舊邏輯：
-                        Caltech101 用 test，其餘資料集用 train。
+        analysis_split: "auto"、"train" 或 "test"。auto 會預設使用 train，
+                        讓 K-means 以訓練集分群。
+        inference_split: "train"、"test"、"auto" 或 "same_as_analysis"。
+                        預設使用 test，讓測試集做推論；auto 也會解析成 test。
     """
     import sys
     sys.path.insert(0, '.')
@@ -2516,11 +2524,23 @@ def run_dataset_analysis_all(
     )
     split = (analysis_split or "auto").lower()
     if split == "auto":
-        split = "test" if dataset == 'Caltech101' else "train"
+        split = "train"
     if split not in {"train", "test"}:
         raise ValueError(f"analysis_split 必須是 'auto'、'train' 或 'test'，目前收到: {analysis_split}")
     analysis_loader = train_loader if split == "train" else test_loader
+    infer_split = (inference_split or "test").lower()
+    if infer_split == "auto":
+        infer_split = "test"
+    if infer_split == "same_as_analysis":
+        infer_split = split
+    if infer_split not in {"train", "test"}:
+        raise ValueError(
+            "inference_split 必須是 'train'、'test' 或 'same_as_analysis'，"
+            f"目前收到: {inference_split}"
+        )
+    inference_loader = train_loader if infer_split == "train" else test_loader
     print(f"K-means analysis split: {split}")
+    print(f"Inference sampling split: {infer_split}")
     display_mean = IMAGENET_MEAN if dataset == 'Caltech101' else None
     display_std = IMAGENET_STD if dataset == 'Caltech101' else None
     
@@ -2569,7 +2589,8 @@ def run_dataset_analysis_all(
     analyzer = ViTAnalyzer(
         model, analysis_loader, img_size=img_size,
         display_mean=display_mean, display_std=display_std,
-        dataset_name=dataset
+        dataset_name=dataset,
+        inference_dataloader=inference_loader,
     )
     return analyzer.full_analysis_all_stages_blocks(
         max_samples=max_samples,

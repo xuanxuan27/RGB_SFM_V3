@@ -1,0 +1,221 @@
+# dataset=Caltech101 num_classes=101 input_shape=(224, 224) patch_size=8 batch_size=16
+# save_dir=runs/train/exp330
+# best_acc=0.7023 test_acc=0.7023 precision=0.5941 recall=0.5856 f1=0.5790 balanced_acc=0.5856
+# returncode=0 elapsed_min=73.6
+# ===== FINAL SUMMARY =====
+Train: 
+	Accuracy: 0.900101346460113, Avg loss: 0.3529820817358861 
+Valid: 
+	Accuracy: 0.7022598870056497, Avg loss: 1.3256718020400857 
+Metrics (macro-average):
+Accuracy      : 0.7000
+Precision     : 0.6033
+Recall        : 0.5842
+F1-score      : 0.5845
+Balanced Acc. : 0.5842
+Test 1: 
+	Accuracy: 0.7, Avg loss: 1.3688523882184191 
+Metrics (macro-average):
+Accuracy      : 0.7023
+Precision     : 0.5941
+Recall        : 0.5856
+F1-score      : 0.5790
+Balanced Acc. : 0.5856
+Test 2: 
+	Accuracy: 0.7022598870056497, Avg loss: 1.3256718020400857 
+checkpoint keys: dict_keys(['model_weights', 'optimizer', 'scheduler', 'train_loss', 'train_acc', 'valid_loss', 'valid_acc', 'best_epoch'])
+# ===== END SUMMARY =====
+
+runs/train/exp
+save_dir: runs/train/exp330
+wandb: ⭐️ View project at https://wandb.ai/xuanxuan27-national-central-university/paper%20experiment
+wandb: 🚀 View run at https://wandb.ai/xuanxuan27-national-central-university/paper%20experiment/runs/kvxlb530
+<class 'dataloader.Caltech101.Caltech101Dataset'>
+MergingViT(
+  (patch_embed): PatchEmbed(
+    (proj): Conv2d(3, 32, kernel_size=(8, 8), stride=(8, 8))
+    (norm): LayerNorm((32,), eps=1e-05, elementwise_affine=True)
+  )
+  (stages): ModuleList(
+    (0): ModuleList(
+      (0): TransformerBlock(
+        (norm1): LayerNorm((32,), eps=1e-05, elementwise_affine=True)
+        (attn): Attention(
+          (qkv): Linear(in_features=32, out_features=96, bias=False)
+          (attn_drop): Dropout(p=0.1, inplace=False)
+          (proj): Linear(in_features=32, out_features=32, bias=True)
+          (proj_drop): Dropout(p=0.1, inplace=False)
+        )
+        (norm2): LayerNorm((32,), eps=1e-05, elementwise_affine=True)
+        (mlp): Mlp(
+          (fc1): Linear(in_features=32, out_features=128, bias=True)
+          (act): GELU(approximate='none')
+          (fc2): Linear(in_features=128, out_features=32, bias=True)
+          (drop): Dropout(p=0.1, inplace=False)
+        )
+        (drop_path): Identity()
+      )
+    )
+    (1): ModuleList(
+      (0): TransformerBlock(
+        (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+        (attn): Attention(
+          (qkv): Linear(in_features=64, out_features=192, bias=False)
+          (attn_drop): Dropout(p=0.1, inplace=False)
+          (proj): Linear(in_features=64, out_features=64, bias=True)
+          (proj_drop): Dropout(p=0.1, inplace=False)
+        )
+        (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+        (mlp): Mlp(
+          (fc1): Linear(in_features=64, out_features=256, bias=True)
+          (act): GELU(approximate='none')
+          (fc2): Linear(in_features=256, out_features=64, bias=True)
+          (drop): Dropout(p=0.1, inplace=False)
+        )
+        (drop_path): DropPath(drop_prob=0.100)
+      )
+    )
+    (2): ModuleList(
+      (0): TransformerBlock(
+        (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (attn): Attention(
+          (qkv): Linear(in_features=128, out_features=384, bias=False)
+          (attn_drop): Dropout(p=0.1, inplace=False)
+          (proj): Linear(in_features=128, out_features=128, bias=True)
+          (proj_drop): Dropout(p=0.1, inplace=False)
+        )
+        (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (mlp): Mlp(
+          (fc1): Linear(in_features=128, out_features=512, bias=True)
+          (act): GELU(approximate='none')
+          (fc2): Linear(in_features=512, out_features=128, bias=True)
+          (drop): Dropout(p=0.1, inplace=False)
+        )
+        (drop_path): DropPath(drop_prob=0.200)
+      )
+    )
+    (3): ModuleList(
+      (0): TransformerBlock(
+        (norm1): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+        (attn): Attention(
+          (qkv): Linear(in_features=256, out_features=768, bias=False)
+          (attn_drop): Dropout(p=0.1, inplace=False)
+          (proj): Linear(in_features=256, out_features=256, bias=True)
+          (proj_drop): Dropout(p=0.1, inplace=False)
+        )
+        (norm2): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+        (mlp): Mlp(
+          (fc1): Linear(in_features=256, out_features=1024, bias=True)
+          (act): GELU(approximate='none')
+          (fc2): Linear(in_features=1024, out_features=256, bias=True)
+          (drop): Dropout(p=0.1, inplace=False)
+        )
+        (drop_path): DropPath(drop_prob=0.300)
+      )
+    )
+  )
+  (pos_embeds): ParameterList(
+      (0): Parameter containing: [torch.float32 of size 1x784x32 (cuda:0)]
+      (1): Parameter containing: [torch.float32 of size 1x196x64 (cuda:0)]
+      (2): Parameter containing: [torch.float32 of size 1x49x128 (cuda:0)]
+      (3): Parameter containing: [torch.float32 of size 1x16x256 (cuda:0)]
+  )
+  (merges): ModuleList(
+    (0): FlexiblePatchMerging(
+      (reduction): Linear(in_features=128, out_features=64, bias=True)
+      (norm): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+    )
+    (1): FlexiblePatchMerging(
+      (reduction): Linear(in_features=256, out_features=128, bias=True)
+      (norm): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+    )
+    (2): FlexiblePatchMerging(
+      (reduction): Linear(in_features=512, out_features=256, bias=True)
+      (norm): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+    )
+    (3): Identity()
+  )
+  (norm_final): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+  (head_drop): Dropout(p=0.1, inplace=False)
+  (head): Linear(in_features=256, out_features=101, bias=True)
+)
+✓ Best epoch: 0, val_acc: 0.2384
+✓ Best epoch: 1, val_acc: 0.2910
+✓ Best epoch: 2, val_acc: 0.3249
+✓ Best epoch: 3, val_acc: 0.3463
+✓ Best epoch: 4, val_acc: 0.3831
+✓ Best epoch: 5, val_acc: 0.4136
+✓ Best epoch: 6, val_acc: 0.4367
+✓ Best epoch: 7, val_acc: 0.4412
+✓ Best epoch: 8, val_acc: 0.4706
+✓ Best epoch: 10, val_acc: 0.4972
+✓ Best epoch: 11, val_acc: 0.5040
+✓ Best epoch: 12, val_acc: 0.5181
+✓ Best epoch: 13, val_acc: 0.5311
+✓ Best epoch: 15, val_acc: 0.5689
+✓ Best epoch: 20, val_acc: 0.5859
+✓ Best epoch: 22, val_acc: 0.5887
+✓ Best epoch: 23, val_acc: 0.5921
+✓ Best epoch: 25, val_acc: 0.6056
+✓ Best epoch: 28, val_acc: 0.6062
+✓ Best epoch: 29, val_acc: 0.6192
+✓ Best epoch: 32, val_acc: 0.6209
+✓ Best epoch: 34, val_acc: 0.6294
+✓ Best epoch: 38, val_acc: 0.6322
+✓ Best epoch: 40, val_acc: 0.6350
+✓ Best epoch: 42, val_acc: 0.6384
+✓ Best epoch: 44, val_acc: 0.6390
+✓ Best epoch: 45, val_acc: 0.6486
+✓ Best epoch: 48, val_acc: 0.6525
+✓ Best epoch: 51, val_acc: 0.6582
+✓ Best epoch: 53, val_acc: 0.6627
+✓ Best epoch: 58, val_acc: 0.6672
+✓ Best epoch: 60, val_acc: 0.6734
+✓ Best epoch: 73, val_acc: 0.6757
+✓ Best epoch: 78, val_acc: 0.6763
+✓ Best epoch: 79, val_acc: 0.6814
+✓ Best epoch: 82, val_acc: 0.6836
+✓ Best epoch: 85, val_acc: 0.6859
+✓ Best epoch: 86, val_acc: 0.6870
+✓ Best epoch: 87, val_acc: 0.6887
+✓ Best epoch: 92, val_acc: 0.6904
+✓ Best epoch: 96, val_acc: 0.6921
+✓ Best epoch: 97, val_acc: 0.6989
+✓ Best epoch: 102, val_acc: 0.7023
+Early stopping at epoch 132
+Train: 
+	Accuracy: 0.900101346460113, Avg loss: 0.3529820817358861 
+Valid: 
+	Accuracy: 0.7022598870056497, Avg loss: 1.3256718020400857 
+Metrics (macro-average):
+Accuracy      : 0.7000
+Precision     : 0.6033
+Recall        : 0.5842
+F1-score      : 0.5845
+Balanced Acc. : 0.5842
+Test 1: 
+	Accuracy: 0.7, Avg loss: 1.3688523882184191 
+Metrics (macro-average):
+Accuracy      : 0.7023
+Precision     : 0.5941
+Recall        : 0.5856
+F1-score      : 0.5790
+Balanced Acc. : 0.5856
+Test 2: 
+	Accuracy: 0.7022598870056497, Avg loss: 1.3256718020400857 
+checkpoint keys: dict_keys(['model_weights', 'optimizer', 'scheduler', 'train_loss', 'train_acc', 'valid_loss', 'valid_acc', 'best_epoch'])
+wandb: 
+wandb: Run summary:
+wandb:  final_test_accuracy 0.70226
+wandb:  final_test_avg_loss 1.32567
+wandb: final_train_accuracy 0.9001
+wandb: final_train_avg_loss 0.35298
+wandb:       train/accuracy 0.92457
+wandb:          train/epoch 132
+wandb:      train/learnrate 1e-05
+wandb:           train/loss 0.26851
+wandb:       valid/accuracy 0.7
+wandb:           valid/loss 1.36885
+wandb: 
+wandb: 🚀 View run HierarchicalViT_Caltech101 at: https://wandb.ai/xuanxuan27-national-central-university/paper%20experiment/runs/kvxlb530
+wandb: ⭐️ View project at: https://wandb.ai/xuanxuan27-national-central-university/paper%20experiment
