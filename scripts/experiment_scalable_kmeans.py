@@ -187,6 +187,7 @@ def run_one_kmeans(
         save_all_inference_repr=defaults.get("save_all_inference_repr", True),
         analysis_split="train",
         inference_split="test",
+        use_kmeans_cache=defaults.get("kmeans_use_cache", True),
     )
     elapsed = time.time() - start
 

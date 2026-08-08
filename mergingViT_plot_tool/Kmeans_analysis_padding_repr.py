@@ -10,10 +10,10 @@ token 模式：
 - 取得各群聚中心最近的 k 張圖的該位置 patch 作為向量代表圖
 - 可判斷輸入圖在該位置的特徵最接近哪個群聚中心
 
-head 模式：
-- 對每個 head 的向量獨立做 K-means
-- 取得各群聚中心最近的 k 張圖的該 head 向量作為向量代表圖
-- 可判斷輸入圖在該 head 的特徵最接近哪個群聚中心
+head 模式（per-(position, head)）：
+- 對每個 (position, head) 的向量獨立做 K-means
+- 取得各群聚中心最近的 k 張圖的該 position patch 作為代表圖（距離用該 head 向量）
+- 可判斷輸入圖在該 (position, head) 的特徵最接近哪個群聚中心
 
 修改：
 將 cluster 代表圖改為 padding 後的圖片
@@ -736,13 +736,38 @@ class ViTAnalyzer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _kmeans_cache_path(cache_dir, stage_idx, block_idx, nc):
+    def _heads_cache_tag(heads):
+        """將 heads 列表轉成 cache 檔名用的穩定字串。"""
+        if heads is None:
+            return "all"
+        return "-".join(str(int(h)) for h in sorted(heads))
+
+    @staticmethod
+    def _normalize_positions_meta(positions):
+        """將 positions 正規化成可寫入 cache meta 的穩定值。"""
+        if positions is None:
+            return "all"
+        return [int(p) for p in sorted(positions)]
+
+    @staticmethod
+    def _kmeans_cache_path(cache_dir, stage_idx, block_idx, nc, mode="token", heads=None):
         """回傳 kmeans_dict 的 .pkl 路徑與對應的 _meta.json 路徑。"""
-        base = Path(cache_dir) / f"stage{stage_idx}_block{block_idx}_nc{nc}"
+        if mode == "token":
+            base = Path(cache_dir) / f"stage{stage_idx}_block{block_idx}_nc{nc}"
+        else:
+            heads_tag = ViTAnalyzer._heads_cache_tag(heads)
+            base = (
+                Path(cache_dir)
+                / f"stage{stage_idx}_block{block_idx}_nc{nc}_mode{mode}_heads{heads_tag}"
+            )
         return base.with_suffix(".pkl"), Path(str(base) + "_meta.json")
 
     @staticmethod
-    def _kmeans_cache_meta(model_path, dataset, stage_idx, block_idx, nc, max_samples):
+    def _kmeans_cache_meta(
+        model_path, save_dir, stage_idx, block_idx, nc, max_samples,
+        mode="token", heads=None,
+        dataset_name=None, analysis_split=None, positions=None, random_state=42,
+    ):
         """建立 cache 有效性比對用的 meta dict。"""
         import os
         model_path = str(model_path) if model_path else ""
@@ -750,14 +775,21 @@ class ViTAnalyzer:
             mtime = float(os.path.getmtime(model_path)) if model_path else 0.0
         except OSError:
             mtime = 0.0
+        heads_meta = None if heads is None else [int(h) for h in sorted(heads)]
         return {
             "model_path": model_path,
             "model_mtime": mtime,
-            "dataset": str(dataset),
+            "save_dir": str(save_dir),
+            "dataset_name": None if dataset_name is None else str(dataset_name),
+            "analysis_split": None if analysis_split is None else str(analysis_split),
+            "positions": ViTAnalyzer._normalize_positions_meta(positions),
+            "random_state": int(random_state),
             "stage": int(stage_idx),
             "block": int(block_idx),
             "n_clusters": int(nc),
             "max_samples": max_samples,
+            "mode": str(mode),
+            "heads": heads_meta,
         }
 
     @staticmethod
@@ -1151,6 +1183,8 @@ class ViTAnalyzer:
                 return
             if "reps" not in row:
                 return  # 展開列，不存
+            if not row.get("reps"):
+                return  # PAD / 缺 cluster 的空列不存，避免餵給 VLM
             if rank is not None:
                 fname = f"s{stage}_b{block_idx}_pos{pos}_top{rank:02d}.png"
             else:
@@ -1183,19 +1217,17 @@ class ViTAnalyzer:
                 )
                 first_rows.extend(rows)
 
-                # rows[0] 是展開列（child_patches），rows[1:] 才是子 patch 的代表圖列
+                # rows[1:] 對應「全部 children（含 PAD）」，不是 valid_children
                 child_stage = parent_stage - 1
-                _child_block_indices = self._resolve_trace_block_indices(child_stage, trace_block)
-                _child_block = _child_block_indices[0]
-                child_ptr = 0
-                for row in rows[1:]:
-                    if child_ptr < len(children):
-                        child_pos = int(children[child_ptr]["pos"])
-                        _save_sr_if_repr(
-                            row, child_stage, _child_block, child_pos,
-                            parent_stage=parent_stage, parent_pos=parent_pos,
-                        )
-                        child_ptr += 1
+                _child_block = self._resolve_trace_block_indices(child_stage, trace_block)[0]
+                all_children = self._children_for_parent(child_stage, parent_pos)
+                for row, child in zip(rows[1:], all_children):
+                    if child["is_pad"] or child["pos"] is None:
+                        continue
+                    _save_sr_if_repr(
+                        row, child_stage, _child_block, int(child["pos"]),
+                        parent_stage=parent_stage, parent_pos=parent_pos,
+                    )
 
                 for child in children:
                     if child["stage"] > 0:
@@ -1225,17 +1257,15 @@ class ViTAnalyzer:
                     pending_expansions.extend(rows)
 
                     child_stage = parent_stage - 1
-                    _child_block_indices = self._resolve_trace_block_indices(child_stage, trace_block)
-                    _child_block = _child_block_indices[0]
-                    child_ptr = 0
-                    for row in rows[1:]:
-                        if child_ptr < len(children):
-                            child_pos = int(children[child_ptr]["pos"])
-                            _save_sr_if_repr(
-                                row, child_stage, _child_block, child_pos,
-                                parent_stage=parent_stage, parent_pos=parent_pos,
-                            )
-                            child_ptr += 1
+                    _child_block = self._resolve_trace_block_indices(child_stage, trace_block)[0]
+                    all_children = self._children_for_parent(child_stage, parent_pos)
+                    for row, child in zip(rows[1:], all_children):
+                        if child["is_pad"] or child["pos"] is None:
+                            continue
+                        _save_sr_if_repr(
+                            row, child_stage, _child_block, int(child["pos"]),
+                            parent_stage=parent_stage, parent_pos=parent_pos,
+                        )
 
                     for child in children:
                         if child["stage"] > 0:
@@ -1580,52 +1610,58 @@ class ViTAnalyzer:
         return representatives
 
     def get_representative_images_per_position_per_head(
-        self, features_heads, images, kmeans_dict, stage_res, patch_size_in_origin,
+        self, features_heads, images, kmeans_dict, stage_idx,
         k_nearest=5, show_progress=True
     ):
         """
         對每個 (position, head) 的每個群聚中心，取得最近的 k 張圖 patch 作為代表圖。
-        距離在 normalized 特徵空間計算，與訓練/推論一致。
+        距離在該 head 的 normalized 特徵空間計算；裁圖仍用該 position 的感受野。
 
         Args:
             features_heads: [N_samples, N, num_heads, head_dim]
             kmeans_dict: dict[(pos, head)] -> KMeans
-            stage_res: (H, W)
-            patch_size_in_origin: (ph, pw)
+            stage_idx: 用於裁出 padding 後的 position patch
+            k_nearest: 每個群聚取幾張代表圖
 
         Returns:
             representatives: dict[(pos, head, cluster)] -> list of patch arrays
         """
+        if features_heads.dim() != 4:
+            raise ValueError(
+                f"`features_heads` 應為 [N_samples, N, num_heads, head_dim]，目前為 {features_heads.shape}"
+            )
+        if not kmeans_dict:
+            return {}
+
         n_clusters = next(iter(kmeans_dict.values())).n_clusters
-    
         representatives = {}
-        positions = list(kmeans_dict.keys())
-        n_pos = len(positions)
-        
-        for i, p in enumerate(positions):
-            X = features[:, p, :].numpy()
+        keys = list(kmeans_dict.keys())
+        n_keys = len(keys)
+
+        for i, (p, h) in enumerate(keys):
+            X = features_heads[:, p, h, :].numpy()
             X_norm = normalize(X, norm='l2', axis=1)
-            kmeans = kmeans_dict[p]
+            kmeans = kmeans_dict[(p, h)]
             centers = kmeans.cluster_centers_
-            
+
             for c in range(n_clusters):
                 dists = np.linalg.norm(X_norm - centers[c], axis=1)
                 nearest_indices = np.argsort(dists)[:k_nearest]
-                
+
                 patches = []
                 for idx in nearest_indices:
                     patch = self._stage_patch_with_padding(images[idx], stage_idx, p)
                     patches.append(patch)
-                representatives[(p, c)] = patches
-            
-            if show_progress and n_pos > 0:
-                pct = 100 * (i + 1) / n_pos
-                step = max(1, n_pos // 20)
-                if (i + 1) % step == 0 or i == n_pos - 1:
-                    print(f"\r     代表圖進度: {i+1}/{n_pos} ({pct:.0f}%)", end="", flush=True)
-        if show_progress and n_pos > 0:
-            print(f"\r     代表圖進度: {n_pos}/{n_pos} (100%)   ")
-        
+                representatives[(p, h, c)] = patches
+
+            if show_progress and n_keys > 0:
+                pct = 100 * (i + 1) / n_keys
+                step = max(1, n_keys // 20)
+                if (i + 1) % step == 0 or i == n_keys - 1:
+                    print(f"\r     代表圖 (pos,head) 進度: {i+1}/{n_keys} ({pct:.0f}%)", end="", flush=True)
+        if show_progress and n_keys > 0:
+            print(f"\r     代表圖 (pos,head) 進度: {n_keys}/{n_keys} (100%)   ")
+
         return representatives
 
     def assign_input_to_clusters(self, features, kmeans_dict):
@@ -2078,6 +2114,7 @@ class ViTAnalyzer:
         trace_max_rows_per_fig=12, trace_expansions_per_fig=2,
         save_all_inference_repr=False,
         use_kmeans_cache=True, model_path=None,
+        dataset_name=None, analysis_split=None, random_state=42,
     ):
         """
         對每個 stage 的最後一個 block 做 K-means 分析並存代表圖。
@@ -2101,6 +2138,9 @@ class ViTAnalyzer:
             save_all_inference_repr: 是否保留舊行為，存所有非 top-k position 的 repr 圖
             use_kmeans_cache: 是否啟用 K-means 結果 cache，相同 model/dataset/n_clusters 時跳過重算
             model_path: model checkpoint 路徑，用於 cache meta 比對，None 時 cache 永遠失效
+            dataset_name: 資料集名稱，寫入 cache meta
+            analysis_split: K-means 使用的 split（train/test），寫入 cache meta
+            random_state: K-means 隨機種子，寫入 cache meta 並傳入分群
         """
         if save_dir is None:
             save_dir = Path(__file__).resolve().parent / 'plots' / 'kmeans_all_stages_blocks'
@@ -2132,14 +2172,20 @@ class ViTAnalyzer:
 
                 pct_total = 100 * (cp_idx + 1) / total_cp if total_cp > 0 else 0
                 print(f"\n=== Stage {stage_idx} Block {block_idx} [總進度 {pct_total:.0f}% ({cp_idx+1}/{total_cp})] (K-means, n_clusters={nc}) ===")
-                patch_h = self.img_size // H
-                patch_w = self.img_size // W
 
-                print(f"  對每個位置做 K-means...")
                 # K-means cache 機制
                 cache_dir = save_dir / "kmeans_cache"
-                pkl_path, meta_path = self._kmeans_cache_path(cache_dir, stage_idx, block_idx, nc)
-                meta = self._kmeans_cache_meta(model_path, str(save_dir), stage_idx, block_idx, nc, max_samples)
+                pkl_path, meta_path = self._kmeans_cache_path(
+                    cache_dir, stage_idx, block_idx, nc, mode="token"
+                )
+                meta = self._kmeans_cache_meta(
+                    model_path, str(save_dir), stage_idx, block_idx, nc, max_samples,
+                    mode="token",
+                    dataset_name=dataset_name,
+                    analysis_split=analysis_split,
+                    positions=positions,
+                    random_state=random_state,
+                )
                 kmeans_dict = None
                 if use_kmeans_cache:
                     kmeans_dict = self._load_kmeans_cache(pkl_path, meta_path, meta)
@@ -2148,7 +2194,8 @@ class ViTAnalyzer:
                 if kmeans_dict is None:
                     print(f"  對每個位置做 K-means...")
                     kmeans_dict, _ = self.run_kmeans_per_position(
-                        features, n_clusters=nc, positions=positions
+                        features, n_clusters=nc, positions=positions,
+                        random_state=random_state,
                     )
                     if use_kmeans_cache:
                         self._save_kmeans_cache(kmeans_dict, pkl_path, meta_path, meta)
@@ -2217,46 +2264,70 @@ class ViTAnalyzer:
             per_pos_dir = stage_dir / "per_position"
             per_head_dir = stage_dir / "per_head"
             stat_dir = stage_dir / "stats"
-            per_pos_dir.mkdir(parents=True, exist_ok=True)
-            per_head_dir.mkdir(parents=True, exist_ok=True)
+            if save_cluster_representatives:
+                per_pos_dir.mkdir(parents=True, exist_ok=True)
+                per_head_dir.mkdir(parents=True, exist_ok=True)
             stat_dir.mkdir(parents=True, exist_ok=True)
 
             pct_total = 100 * (cp_idx + 1) / total_cp if total_cp > 0 else 0
             print(f"\n=== Stage {stage_idx} Block {block_idx} [總進度 {pct_total:.0f}% ({cp_idx+1}/{total_cp})] (per-head K-means, n_clusters={nc}) ===")
-            patch_h = self.img_size // H
-            patch_w = self.img_size // W
             num_heads = int(features_heads.shape[2])
             heads_to_use = list(range(num_heads)) if heads is None else list(heads)
 
-            print("  對每個 (position, head) 做 K-means...")
-            kmeans_head_dict, _ = self.run_kmeans_per_position_per_head(
-                features_heads, n_clusters=nc, positions=positions, heads=heads_to_use
+            cache_dir = save_dir / "kmeans_cache"
+            pkl_path, meta_path = self._kmeans_cache_path(
+                cache_dir, stage_idx, block_idx, nc, mode="head", heads=heads_to_use
             )
+            meta = self._kmeans_cache_meta(
+                model_path, str(save_dir), stage_idx, block_idx, nc, max_samples,
+                mode="head", heads=heads_to_use,
+                dataset_name=dataset_name,
+                analysis_split=analysis_split,
+                positions=positions,
+                random_state=random_state,
+            )
+            kmeans_head_dict = None
+            if use_kmeans_cache:
+                kmeans_head_dict = self._load_kmeans_cache(pkl_path, meta_path, meta)
+                if kmeans_head_dict is not None:
+                    print(f"  ✓ 載入 K-means cache (stage{stage_idx}_block{block_idx}_nc{nc}_head)")
+            if kmeans_head_dict is None:
+                print("  對每個 (position, head) 做 K-means...")
+                kmeans_head_dict, _ = self.run_kmeans_per_position_per_head(
+                    features_heads, n_clusters=nc, positions=positions,
+                    heads=heads_to_use, random_state=random_state,
+                )
+                if use_kmeans_cache:
+                    self._save_kmeans_cache(kmeans_head_dict, pkl_path, meta_path, meta)
+                    print(f"  ✓ 已存 K-means cache (stage{stage_idx}_block{block_idx}_nc{nc}_head)")
 
             print("  取得各 (position, head, cluster) 的代表圖...")
             representatives_head = self.get_representative_images_per_position_per_head(
-                features_heads, images, kmeans_head_dict, (H, W), (patch_h, patch_w),
+                features_heads, images, kmeans_head_dict, stage_idx,
                 k_nearest=k_nearest
             )
 
-            # 視覺化 A: 固定 position，比較所有 head（儲存所有位置）
-            pos_to_save = sorted(list({p for (p, _) in kmeans_head_dict.keys()}))
-            print(f"  儲存每個 position 的 head 比較圖 ({len(pos_to_save)} 個位置)...")
-            for p in pos_to_save:
-                self.visualize_heads_for_position_clusters(
-                    representatives_head, p, heads_to_use, nc, k_nearest=k_nearest,
-                    save_path=per_pos_dir / f"repr_heads_pos{p}",
-                    show=False, clusters_per_fig=clusters_per_fig
-                )
+            if save_cluster_representatives:
+                # 視覺化 A: 固定 position，比較所有 head（儲存所有位置）
+                pos_to_save = sorted(list({p for (p, _) in kmeans_head_dict.keys()}))
+                print(f"  儲存每個 position 的 head 比較圖 ({len(pos_to_save)} 個位置)...")
+                for p in pos_to_save:
+                    self.visualize_heads_for_position_clusters(
+                        representatives_head, p, heads_to_use, nc, k_nearest=k_nearest,
+                        save_path=per_pos_dir / f"repr_heads_pos{p}",
+                        show=False, clusters_per_fig=clusters_per_fig
+                    )
 
-            # 視覺化 B: 固定 head，比較所有 position（儲存所有 head）
-            print(f"  儲存每個 head 的 position 比較圖 ({len(heads_to_use)} 個 head)...")
-            for h in heads_to_use:
-                self.visualize_positions_for_head_clusters(
-                    representatives_head, h, pos_to_save, nc, k_nearest=k_nearest,
-                    save_path=per_head_dir / f"repr_positions_head{h}",
-                    show=False, clusters_per_fig=clusters_per_fig
-                )
+                # 視覺化 B: 固定 head，比較所有 position（儲存所有 head）
+                print(f"  儲存每個 head 的 position 比較圖 ({len(heads_to_use)} 個 head)...")
+                for h in heads_to_use:
+                    self.visualize_positions_for_head_clusters(
+                        representatives_head, h, pos_to_save, nc, k_nearest=k_nearest,
+                        save_path=per_head_dir / f"repr_positions_head{h}",
+                        show=False, clusters_per_fig=clusters_per_fig
+                    )
+            else:
+                print("  略過 stage/block 的 per-head cluster 代表圖儲存（save_cluster_representatives=False）")
 
             print("  統計 head 的 cluster 使用分布與 head 間差異...")
             labels_per_head = self.assign_input_to_clusters_per_head(features_heads, kmeans_head_dict)
@@ -2290,8 +2361,385 @@ class ViTAnalyzer:
             }
 
         if m_inference is not None and m_inference > 0:
-            print("注意: mode='head' 目前未額外實作 inference 視覺化，已略過 m_inference。")
+            self._infer_and_save_m_images_head(
+                all_results, m_inference, n_clusters, k_nearest,
+                save_dir, inference_seed, n_clusters_per_stage,
+                gradcam_top_k=gradcam_top_k,
+                trace_block=trace_block,
+                save_gradcam_trace=save_gradcam_trace,
+                save_all_inference_repr=save_all_inference_repr,
+            )
         return all_results
+
+    def visualize_and_save_head_assignment(
+        self, img, labels_single_head, H, W, heads, n_clusters, save_prefix, heads_per_fig=8
+    ):
+        """
+        儲存 per-head cluster 指派視覺化。
+        每張圖包含原圖 + 多個 head 的 HxW cluster map。
+        labels_single_head: dict[(pos, head)] -> int
+        """
+        heads = list(heads)
+        n_parts = (len(heads) + heads_per_fig - 1) // heads_per_fig
+        img_np = self._image_to_numpy(img)
+        cmap = plt.cm.get_cmap('tab10', n_clusters) if n_clusters <= 10 else 'viridis'
+        vmax = n_clusters - 1 if n_clusters > 1 else 1
+
+        for part_idx in range(max(n_parts, 1)):
+            hs = heads[part_idx * heads_per_fig:(part_idx + 1) * heads_per_fig]
+            if not hs:
+                break
+            n_panels = 1 + len(hs)
+            n_cols = 3
+            n_rows = int(np.ceil(n_panels / n_cols))
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.4 * n_cols, 3.4 * n_rows))
+            axes = np.asarray(axes).reshape(-1)
+
+            axes[0].imshow(img_np)
+            axes[0].set_title("Original")
+            axes[0].axis("off")
+
+            for idx, h in enumerate(hs, start=1):
+                grid = np.full((H, W), -1.0, dtype=np.float32)
+                for p in range(H * W):
+                    key = (p, h)
+                    if key in labels_single_head:
+                        grid[p // W, p % W] = float(labels_single_head[key])
+                im = axes[idx].imshow(grid, cmap=cmap, vmin=0, vmax=vmax)
+                axes[idx].set_title(f"Head {h}")
+                axes[idx].axis("off")
+                plt.colorbar(im, ax=axes[idx], fraction=0.046, pad=0.02)
+
+            for idx in range(n_panels, len(axes)):
+                axes[idx].axis("off")
+
+            plt.tight_layout()
+            out_path = Path(f"{save_prefix}_part{part_idx}.png")
+            plt.savefig(out_path, dpi=150)
+            plt.close(fig)
+
+    def save_head_labels_json(self, labels_single_head, out_path, H, W, heads):
+        """儲存單張圖的 per-(pos, head) cluster 指派。"""
+        payload = {
+            "H": int(H),
+            "W": int(W),
+            "heads": [int(h) for h in heads],
+            "labels": [
+                {"pos": int(p), "head": int(h), "cluster": int(c)}
+                for (p, h), c in sorted(labels_single_head.items())
+            ],
+        }
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def _save_inference_repr_per_head(
+        self, img, labels_single_head, representatives_head, k_nearest,
+        inference_dir, img_idx, stage_idx, block_idx, heads=None,
+    ):
+        """
+        對每個 (pos, head) 存「input patch + 該 head cluster 代表圖」單列 PNG。
+        輸出至 inference/all_pos_head_trace/img{idx}/
+        """
+        out_dir = Path(inference_dir) / "all_pos_head_trace" / f"img{img_idx}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        pairs = sorted(labels_single_head.keys(), key=lambda x: (x[0], x[1]))
+        if heads is not None:
+            head_set = set(int(h) for h in heads)
+            pairs = [(p, h) for (p, h) in pairs if int(h) in head_set]
+
+        for pos, head in pairs:
+            cluster = labels_single_head[(pos, head)]
+            reps = representatives_head.get((pos, head, cluster), [])[:k_nearest]
+            row = {
+                "input_patch": self._stage_patch(img, stage_idx, pos),
+                "reps": reps,
+            }
+            parent = self._parent_for_stage_position(stage_idx, pos)
+            if parent is None:
+                fname = f"s{stage_idx}_b{block_idx}_pos{pos}_head{head}_top00.png"
+            else:
+                parent_stage, parent_pos = parent
+                fname = (
+                    f"s{stage_idx}_b{block_idx}_pos{pos}_head{head}_"
+                    f"parent_s{parent_stage}p{parent_pos}.png"
+                )
+            self._save_single_row_image(row, out_dir / fname, n_repr=k_nearest)
+
+    def _cluster_records_for_position_per_head(
+        self, labels_by_checkpoint, stage_idx, pos, heads, trace_block="last"
+    ):
+        """GradCAM JSON 用：回傳各 block 下每個 head 的 cluster 指派。"""
+        records = []
+        for block_idx in self._resolve_trace_block_indices(stage_idx, trace_block):
+            labels_single = labels_by_checkpoint.get((stage_idx, block_idx), {})
+            head_records = []
+            for h in heads:
+                key = (int(pos), int(h))
+                if key in labels_single:
+                    head_records.append({
+                        "head": int(h),
+                        "cluster": int(labels_single[key]),
+                        "missing_kmeans": False,
+                    })
+                else:
+                    head_records.append({
+                        "head": int(h),
+                        "cluster": None,
+                        "missing_kmeans": True,
+                    })
+            records.append({
+                "block": int(block_idx),
+                "heads": head_records,
+            })
+        return records
+
+    def build_gradcam_trace_payload_head(
+        self, img_idx, gradcam_result, traces, labels_by_checkpoint,
+        heads, trace_block="last"
+    ):
+        """組合 head 模式的 GradCAM top-k / 回溯 / per-head cluster labels。"""
+        last_stage_idx = len(self.stage_resolutions) - 1
+        heads = [int(h) for h in heads]
+        payload = {
+            "img_idx": int(img_idx),
+            "mode": "head",
+            "heads": heads,
+            "target_class": int(gradcam_result["target_class"]),
+            "pred_class": int(gradcam_result["pred_class"]),
+            "last_stage": int(last_stage_idx),
+            "last_stage_H": int(gradcam_result["H"]),
+            "last_stage_W": int(gradcam_result["W"]),
+            "trace_block": trace_block,
+            "cam": gradcam_result["cam"].tolist(),
+            "top_positions": [],
+        }
+
+        for top_item in gradcam_result["top_positions"]:
+            last_pos = int(top_item["pos"])
+            item_payload = {
+                **top_item,
+                "clusters": self._cluster_records_for_position_per_head(
+                    labels_by_checkpoint, last_stage_idx, last_pos, heads, trace_block
+                ),
+                "sources_by_stage": {},
+            }
+            for stage_idx in range(last_stage_idx - 1, -1, -1):
+                source_items = []
+                for source in traces[last_pos].get(stage_idx, []):
+                    pos = source["pos"]
+                    source_payload = dict(source)
+                    if source["is_pad"] or pos is None:
+                        source_payload["clusters"] = []
+                    else:
+                        source_payload["clusters"] = self._cluster_records_for_position_per_head(
+                            labels_by_checkpoint, stage_idx, int(pos), heads, trace_block
+                        )
+                    source_items.append(source_payload)
+                item_payload["sources_by_stage"][str(stage_idx)] = source_items
+            payload["top_positions"].append(item_payload)
+        return payload
+
+    def save_topk_trace_representative_pages_head(
+        self, img, all_results, labels_by_checkpoint, gradcam_result,
+        trace_dir, heads, trace_block="last", k_nearest=4,
+    ):
+        """
+        GradCAM top-k 回溯：對每個 traced position × head 存 single-row 代表圖。
+        命名：s{S}_b{B}_pos{P}_head{H}_top{R}.png 或 ..._parent_s{PS}p{PP}.png
+        """
+        trace_dir = Path(trace_dir)
+        single_rows_dir = trace_dir / "single_rows"
+        single_rows_dir.mkdir(parents=True, exist_ok=True)
+        last_stage_idx = len(self.stage_resolutions) - 1
+        heads = [int(h) for h in heads]
+
+        def _save_pos_heads(stage, pos, *, rank=None, parent_stage=None, parent_pos=None):
+            block_indices = self._resolve_trace_block_indices(stage, trace_block)
+            block_idx = block_indices[0]
+            key = (stage, block_idx)
+            if key not in all_results or key not in labels_by_checkpoint:
+                return
+            labels_single = labels_by_checkpoint[key]
+            representatives = all_results[key]["representatives_head"]
+            for h in heads:
+                cluster = labels_single.get((int(pos), int(h)))
+                if cluster is None:
+                    continue
+                reps = representatives.get((int(pos), int(h), int(cluster)), [])[:k_nearest]
+                if not reps:
+                    continue
+                row = {
+                    "input_patch": self._stage_patch(img, stage, pos),
+                    "reps": reps,
+                }
+                if rank is not None:
+                    fname = f"s{stage}_b{block_idx}_pos{pos}_head{h}_top{rank:02d}.png"
+                else:
+                    fname = (
+                        f"s{stage}_b{block_idx}_pos{pos}_head{h}_"
+                        f"parent_s{parent_stage}p{parent_pos}.png"
+                    )
+                self._save_single_row_image(row, single_rows_dir / fname, n_repr=k_nearest)
+
+        for top_item in gradcam_result["top_positions"]:
+            rank = int(top_item["rank"])
+            top_pos = int(top_item["pos"])
+            _save_pos_heads(last_stage_idx, top_pos, rank=rank)
+
+            queue = [(last_stage_idx, top_pos)]
+            visited = {(last_stage_idx, top_pos)}
+            while queue:
+                parent_stage, parent_pos = queue.pop(0)
+                if parent_stage <= 0:
+                    continue
+                child_stage = parent_stage - 1
+                for child in self._children_for_parent(child_stage, parent_pos):
+                    if child.get("is_pad") or child.get("pos") is None:
+                        continue
+                    child_pos = int(child["pos"])
+                    node = (child_stage, child_pos)
+                    if node in visited:
+                        continue
+                    visited.add(node)
+                    _save_pos_heads(
+                        child_stage, child_pos,
+                        parent_stage=parent_stage, parent_pos=parent_pos,
+                    )
+                    queue.append(node)
+
+    def _infer_and_save_m_images_head(
+        self, all_results, m, n_clusters, k_nearest, save_dir, seed=42,
+        n_clusters_per_stage=None, gradcam_top_k=10, trace_block="last",
+        save_gradcam_trace=True, save_all_inference_repr=False,
+    ):
+        """
+        head 模式推論：
+          inference/img{i}_original.png
+          inference/img{i}_s{s}_b{b}_head_assign_part{p}.png
+          inference/img{i}_s{s}_b{b}_head_labels.json
+          可選 all_pos_head_trace / GradCAM top-k per-head 代表圖
+        """
+        inference_dir = Path(save_dir) / "inference"
+        inference_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n=== 隨機取 {m} 張圖推論 per-head cluster 指派 ===")
+        sample_imgs, sample_gt_labels = self.sample_random_images(m, seed=seed)
+        trace_jsonl_path = inference_dir / "gradcam_trace_clusters_head.jsonl"
+
+        with torch.no_grad():
+            imgs = sample_imgs.to(self.device)
+            infer_checkpoints = get_all_features_and_heads_at_checkpoints(self.model, imgs)
+            logits = self.model(imgs)
+            sample_pred_labels = logits.argmax(dim=1).cpu()
+
+        n_imgs = sample_imgs.shape[0]
+        for img_idx in range(n_imgs):
+            pct_img = 100 * (img_idx + 1) / n_imgs if n_imgs > 0 else 0
+            print(f"\n  推論進度: 圖 {img_idx+1}/{n_imgs} ({pct_img:.0f}%)")
+            img = sample_imgs[img_idx]
+            img_np = self._image_to_numpy(img)
+
+            gt = int(sample_gt_labels[img_idx].item())
+            pred = int(sample_pred_labels[img_idx].item())
+            gt_name = self.format_class_label(gt)
+            pred_name = self.format_class_label(pred)
+            correct = (gt == pred)
+            title_color = "lime" if correct else "red"
+            title_str = f"GT: {gt_name}  |  Pred: {pred_name}"
+
+            fig, ax = plt.subplots(figsize=(4, 4.3))
+            ax.imshow(img_np)
+            ax.set_title(title_str, fontsize=10, color=title_color,
+                         bbox=dict(facecolor='black', alpha=0.6, pad=3))
+            ax.axis('off')
+            plt.savefig(inference_dir / f"img{img_idx}_original.png",
+                        bbox_inches='tight', pad_inches=0.1, dpi=150)
+            plt.close(fig)
+
+            labels_by_checkpoint = {}
+            heads_by_checkpoint = {}
+            for (stage_idx, block_idx), res in all_results.items():
+                kmeans_head_dict = res['kmeans_head_dict']
+                representatives_head = res['representatives_head']
+                H, W = res['H'], res['W']
+                heads_used = res.get('heads_used') or list(range(int(res.get('num_heads', 1))))
+                nc = res.get('n_clusters') or (
+                    n_clusters_per_stage.get(stage_idx, n_clusters) if n_clusters_per_stage else n_clusters
+                )
+
+                feat_heads = infer_checkpoints[(stage_idx, block_idx)][1][img_idx:img_idx + 1].cpu()
+                labels = self.assign_input_to_clusters_per_head(feat_heads, kmeans_head_dict)
+                labels_single = {(int(p), int(h)): int(arr[0]) for (p, h), arr in labels.items()}
+                labels_by_checkpoint[(int(stage_idx), int(block_idx))] = labels_single
+                heads_by_checkpoint[(int(stage_idx), int(block_idx))] = heads_used
+
+                save_prefix = inference_dir / f"img{img_idx}_s{stage_idx}_b{block_idx}_head_assign"
+                self.visualize_and_save_head_assignment(
+                    sample_imgs[img_idx], labels_single, H, W, heads_used, nc,
+                    save_prefix=save_prefix, heads_per_fig=8
+                )
+                self.save_head_labels_json(
+                    labels_single,
+                    inference_dir / f"img{img_idx}_s{stage_idx}_b{block_idx}_head_labels.json",
+                    H, W, heads_used,
+                )
+                if save_all_inference_repr:
+                    self._save_inference_repr_per_head(
+                        sample_imgs[img_idx], labels_single, representatives_head,
+                        k_nearest, inference_dir, img_idx, stage_idx, block_idx,
+                        heads=heads_used,
+                    )
+
+            if save_gradcam_trace and gradcam_top_k is not None and gradcam_top_k > 0:
+                # 用任一 checkpoint 的 heads（通常各 stage 相同）；取最後 stage
+                last_stage_idx = len(self.stage_resolutions) - 1
+                last_block = max(
+                    b for (s, b) in labels_by_checkpoint.keys() if s == last_stage_idx
+                )
+                heads_used = heads_by_checkpoint[(last_stage_idx, last_block)]
+
+                gradcam_result = self.compute_gradcam_topk(img, top_k=gradcam_top_k)
+                traces = self.trace_last_stage_positions(gradcam_result["top_positions"])
+                trace_payload = self.build_gradcam_trace_payload_head(
+                    img_idx, gradcam_result, traces, labels_by_checkpoint,
+                    heads=heads_used, trace_block=trace_block,
+                )
+
+                per_img_json = inference_dir / f"img{img_idx}_gradcam_trace_clusters_head.json"
+                with open(per_img_json, "w", encoding="utf-8") as f:
+                    json.dump(trace_payload, f, ensure_ascii=False, indent=2)
+
+                mode = "w" if img_idx == 0 else "a"
+                with open(trace_jsonl_path, mode, encoding="utf-8") as f:
+                    f.write(json.dumps(trace_payload, ensure_ascii=False) + "\n")
+
+                trace_dir = inference_dir / "gradcam_trace" / f"img{img_idx}"
+                trace_dir.mkdir(parents=True, exist_ok=True)
+                self.save_gradcam_topk_overview(
+                    img, gradcam_result,
+                    trace_dir / f"img{img_idx}_gradcam_top{gradcam_top_k}_overview.png"
+                )
+                self.save_gradcam_trace_summary(
+                    gradcam_result, traces,
+                    trace_dir / f"img{img_idx}_gradcam_top{gradcam_top_k}_trace_summary.png"
+                )
+                self.save_topk_trace_representative_pages_head(
+                    img, all_results, labels_by_checkpoint, gradcam_result,
+                    trace_dir,
+                    heads=heads_used,
+                    trace_block=trace_block,
+                    k_nearest=k_nearest,
+                )
+                print(f"    已存 img{img_idx} 的 GradCAM top-{gradcam_top_k} per-head 回溯")
+
+            msg = f"    已存 img{img_idx} 的原始圖與 per-head cluster 指派"
+            if save_gradcam_trace and gradcam_top_k is not None and gradcam_top_k > 0:
+                msg += "、GradCAM top-k per-head trace"
+            if save_all_inference_repr:
+                msg += "、所有 (pos, head) 代表圖"
+            print(msg)
 
     def _infer_and_save_m_images(
         self, all_results, m, n_clusters, k_nearest, save_dir, seed=42,
@@ -2537,6 +2985,8 @@ def run_dataset_analysis_all(
     trace_expansions_per_fig=2, save_all_inference_repr=False,
     analysis_split="auto",
     inference_split="test",
+    use_kmeans_cache=True,
+    random_state=42,
 ):
     """
     對每個 stage、每個 block、每個 position 存代表圖。
@@ -2552,6 +3002,8 @@ def run_dataset_analysis_all(
                         讓 K-means 以訓練集分群。
         inference_split: "train"、"test"、"auto" 或 "same_as_analysis"。
                         預設使用 test，讓測試集做推論；auto 也會解析成 test。
+        use_kmeans_cache: 是否啟用 K-means cache
+        random_state: K-means 隨機種子
     """
     import sys
     sys.path.insert(0, '.')
@@ -2652,8 +3104,11 @@ def run_dataset_analysis_all(
         trace_max_rows_per_fig=trace_max_rows_per_fig,
         trace_expansions_per_fig=trace_expansions_per_fig,
         save_all_inference_repr=save_all_inference_repr,
-        use_kmeans_cache=True,
-        model_path=model_path
+        use_kmeans_cache=use_kmeans_cache,
+        model_path=model_path,
+        dataset_name=dataset,
+        analysis_split=split,
+        random_state=random_state,
     )
 
 

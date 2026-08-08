@@ -110,8 +110,8 @@ def run_step_kmeans(cfg: dict) -> Path:
         save_cluster_representatives=False,
         model_args=model_args,
         data_root=data_root,
-        mode="token",
-        heads=None,
+        mode=cfg.get("kmeans_mode", "token"),
+        heads=cfg.get("kmeans_heads", None),
         analysis_batch_size=cfg.get("batch_size", 4),
         model_name=model_name,
         gradcam_top_k=cfg.get("gradcam_trace_top_k", 5),
@@ -122,6 +122,7 @@ def run_step_kmeans(cfg: dict) -> Path:
         save_all_inference_repr=cfg.get("save_all_inference_repr", False),
         analysis_split="train",
         inference_split="test",
+        use_kmeans_cache=cfg.get("kmeans_use_cache", True),
     )
 
     gradcam_trace_dir = Path(save_dir) / "inference" / "gradcam_trace"
