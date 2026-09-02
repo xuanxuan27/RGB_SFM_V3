@@ -1,28 +1,36 @@
 # ---------------------------------------------------------------------------
-# Vision-Language (Qwen2-VL-7B) — 建議獨立 venv，避免與主專案套件版本打架
+# Vision-Language（Qwen2-VL / Qwen2.5-VL / InternVL2）
+# 建議獨立 venv，避免與主專案套件版本打架
 #
 # PyTorch（CUDA 12.x，依你環境擇一安裝）例如：
 #   pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124
-# 若與主專案共用同一 venv，可略過下列 torch 兩行，僅安裝其餘套件。
+# 若與主專案共用同一 venv，可略過 torch / torchvision，僅安裝其餘套件。
+# InternVL 影像前處理會用到 torchvision.transforms。
 # ---------------------------------------------------------------------------
 
-# Hugging Face：Qwen2-VL 需含 qwen2_vl 的較新版本（過舊會 KeyError）
-transformers>=4.46.0
+# Hugging Face：
+#   Qwen2-VL     需含 qwen2_vl 的版本
+#   Qwen2.5-VL   需 transformers>=4.49.0（才有 Qwen2_5_VLForConditionalGeneration）
+transformers>=4.49.0
 accelerate>=0.34.0
 safetensors>=0.4.0
 huggingface_hub>=0.24.0
 
-# Qwen2-VL 官方建議：處理 base64 / URL / 多圖與 process_vision_info
+# Qwen2-VL / Qwen2.5-VL：處理 base64 / URL / 多圖與 process_vision_info
 qwen-vl-utils>=0.0.8
+
+# InternVL2 remote code（vision encoder）
+einops>=0.8.0
+timm>=0.9.12
 
 # 影像與編解碼
 Pillow>=10.0.0
 
-# 多數 Qwen tokenizer 會用到
+# 多數 Qwen / InternVL tokenizer 會用到
 sentencepiece>=0.2.0
 protobuf>=4.25.0
 
-# 選用：4-bit / 8-bit 量化，16GB VRAM 吃緊時再裝（需 CUDA）
+# 選用：4-bit / 8-bit 量化，16GB VRAM 吃緊時再裝（需 CUDA；InternVL --internvl-quant）
 bitsandbytes>=0.43.0
 
 # 選用：有編譯環境且要加速／省顯存時再裝（安裝失敗可略過）

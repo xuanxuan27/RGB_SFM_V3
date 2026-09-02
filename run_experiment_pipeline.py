@@ -81,6 +81,8 @@ def run_step_kmeans(cfg: dict) -> Path:
     n_clusters_per_stage = {i: v for i, v in enumerate(clusters_list)}
     save_dir     = cfg.get("kmeans_save_dir", "plots/kmeans/Caltech101/")
     data_root    = str(Path(cfg["root"]) / "data")
+    inference_image_dir = cfg.get("kmeans_inference_image_dir") or None
+    m_inference = cfg.get("m_inference", 3)
 
     print("\n" + "=" * 60)
     print("Step 1：K-means 分析")
@@ -92,6 +94,9 @@ def run_step_kmeans(cfg: dict) -> Path:
         print("  model_args : 從目前 config.py 讀取")
     print(f"  dataset    : {dataset}")
     print(f"  save_dir   : {save_dir}")
+    if inference_image_dir:
+        print(f"  inference_image_dir : {inference_image_dir}")
+        print(f"  m_inference: {m_inference}  (folder 模式；None=全部，數字=依檔名排序取前 m 張)")
     print("=" * 60)
 
     run_dataset_analysis_all(
@@ -105,7 +110,7 @@ def run_step_kmeans(cfg: dict) -> Path:
         clusters_per_fig=1,
         positions=None,
         save_dir=save_dir,
-        m_inference=cfg.get("m_inference", 3),
+        m_inference=m_inference,
         inference_seed=cfg.get("inference_seed", 42),
         save_cluster_representatives=False,
         model_args=model_args,
@@ -122,6 +127,7 @@ def run_step_kmeans(cfg: dict) -> Path:
         save_all_inference_repr=cfg.get("save_all_inference_repr", False),
         analysis_split="train",
         inference_split="test",
+        inference_image_dir=inference_image_dir,
         use_kmeans_cache=cfg.get("kmeans_use_cache", True),
     )
 

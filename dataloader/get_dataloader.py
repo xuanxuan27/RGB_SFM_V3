@@ -1,4 +1,4 @@
-
+import torch
 from medmnist import INFO, Evaluator, PathMNIST
 
 from torch.utils.data import DataLoader
@@ -24,6 +24,7 @@ from .CIFAR10 import CIFAR10
 from .Colorful_MNIST import Colorful_MNIST
 from torchvision import transforms
 from .Caltech101 import Caltech101Dataset
+from .NonclassicFace import NonclassicFaceDataset
 dataset_classes = {
     'mnist': MNISTDataset,
     'MultiColor_Shapes_Database': MultiColorShapesDataset,
@@ -49,7 +50,8 @@ dataset_classes = {
     "BloodMNIST" :  CustomerBloodMNIST,
     'APROS_2019' : APROS_2019Dataset,
     'PreprocessedRetinaMNIST224' : PreprocessedRetinaMNIST224,
-    'Caltech101' : Caltech101Dataset
+    'Caltech101' : Caltech101Dataset,
+    'NonclassicFace': NonclassicFaceDataset,
 }
 
 

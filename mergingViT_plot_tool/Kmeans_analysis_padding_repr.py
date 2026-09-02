@@ -30,11 +30,74 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 import torch.nn as nn
 import numpy as np
+from PIL import Image
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import normalize
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
 from models.MergingViT import MergingViT
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+class FolderInferenceDataset(Dataset):
+    """從資料夾讀取圖片作為 K-means inference 輸入（依檔名排序）。"""
+
+    sample_in_order = True
+
+    def __init__(self, root, transform=None, recursive=True):
+        self.root = Path(root)
+        self.transform = transform
+        if not self.root.is_dir():
+            raise FileNotFoundError(f"找不到 inference 圖片資料夾: {self.root}")
+
+        pattern = "**/*" if recursive else "*"
+        paths = [
+            p for p in sorted(self.root.glob(pattern))
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        if not paths:
+            raise RuntimeError(f"inference 資料夾沒有可用圖片: {self.root}")
+        self.paths = paths
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        path = self.paths[index]
+        img = Image.open(path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        # 無標籤：用 -1，僅供顯示 Pred
+        return img, torch.tensor(-1, dtype=torch.long)
+
+
+def build_inference_transform(dataset_name, img_size):
+    """與 get_dataloader 的 test/eval transform 對齊，避免 inference 輸入分布不一致。"""
+    if dataset_name == "Caltech101":
+        return transforms.Compose([
+            transforms.Lambda(lambda img: img.convert("RGB")),
+            transforms.Resize(256),
+            transforms.CenterCrop(img_size),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+    return transforms.Compose([
+        transforms.Resize([img_size, img_size]),
+        transforms.ToTensor(),
+        transforms.ConvertImageDtype(torch.float),
+    ])
+
+
+def build_folder_inference_loader(image_dir, dataset_name, img_size, batch_size=1):
+    dataset = FolderInferenceDataset(
+        root=image_dir,
+        transform=build_inference_transform(dataset_name, img_size),
+        recursive=True,
+    )
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
 
 def get_features_before_merge(model, x, stage_idx):
@@ -332,6 +395,7 @@ class ViTAnalyzer:
         self.dataset_name = dataset_name
         self.label_names = self._build_label_names()
         self.stage_resolutions = self._build_stage_resolutions()
+        self.last_sampled_sources = []
 
     def _build_label_names(self):
         dataset = getattr(self.dataloader, "dataset", None)
@@ -367,6 +431,8 @@ class ViTAnalyzer:
 
     def format_class_label(self, class_idx):
         class_idx = int(class_idx)
+        if class_idx < 0:
+            return "n/a"
         name = self.label_names.get(class_idx)
         if name is None or name == str(class_idx):
             return str(class_idx)
@@ -1708,25 +1774,53 @@ class ViTAnalyzer:
 
     def sample_random_images(self, m, seed=None):
         """
-        從 inference dataloader.dataset 直接依 index 均勻隨機取 m 張圖片。
-        同一個 seed 會得到同一批 dataset index，不受 DataLoader shuffle 影響。
-        
+        從 inference dataloader.dataset 取圖。
+
+        - 一般 dataset：依 seed 均勻隨機取 m 張（不受 DataLoader shuffle 影響）
+        - FolderInferenceDataset（sample_in_order=True）：依檔名排序取前 m 張；
+          m 為 None 時取資料夾全部
+
         Returns:
             images: [m, 3, H_img, W_img]
+            labels: [m]
         """
-        if m is None or m <= 0:
-            return torch.empty((0, 3, self.img_size, self.img_size)), torch.empty((0,), dtype=torch.long)
-
-        rng = np.random.default_rng(seed)
         dataset = getattr(self.inference_dataloader, "dataset", None)
         if dataset is None or len(dataset) == 0:
-            return torch.empty((0, 3, self.img_size, self.img_size)), torch.empty((0,), dtype=torch.long)
+            self.last_sampled_sources = []
+            return (
+                torch.empty((0, 3, self.img_size, self.img_size)),
+                torch.empty((0,), dtype=torch.long),
+            )
 
-        n_pick = min(int(m), len(dataset))
-        indices = rng.choice(len(dataset), size=n_pick, replace=False).tolist()
+        sample_in_order = bool(getattr(dataset, "sample_in_order", False))
+        if m is None:
+            if sample_in_order:
+                n_pick = len(dataset)
+            else:
+                self.last_sampled_sources = []
+                return (
+                    torch.empty((0, 3, self.img_size, self.img_size)),
+                    torch.empty((0,), dtype=torch.long),
+                )
+        elif m <= 0:
+            self.last_sampled_sources = []
+            return (
+                torch.empty((0, 3, self.img_size, self.img_size)),
+                torch.empty((0,), dtype=torch.long),
+            )
+        else:
+            n_pick = min(int(m), len(dataset))
+
+        if sample_in_order:
+            indices = list(range(n_pick))
+        else:
+            rng = np.random.default_rng(seed)
+            indices = rng.choice(len(dataset), size=n_pick, replace=False).tolist()
+
         sampled = []
+        sources = []
         for order, idx in enumerate(indices):
-            if seed is None:
+            if sample_in_order or seed is None:
                 img, lbl = dataset[int(idx)]
             else:
                 item_seed = int(seed) + int(order)
@@ -1757,9 +1851,46 @@ class ViTAnalyzer:
                 lbl_tensor = torch.tensor(lbl_value, dtype=torch.long)
             sampled.append((img, lbl_tensor))
 
+            paths = getattr(dataset, "paths", None)
+            if paths is not None and 0 <= int(idx) < len(paths):
+                sources.append(str(paths[int(idx)]))
+            else:
+                sources.append(f"dataset_idx={int(idx)}")
+
+        self.last_sampled_sources = sources
         images = torch.stack([item[0] for item in sampled], dim=0)
         labels = torch.stack([item[1] for item in sampled], dim=0)
         return images, labels
+
+    def _inference_title(self, gt, pred, img_idx):
+        """組 original.png 標題；資料夾輸入無 GT 時改顯示來源檔名。"""
+        pred_name = self.format_class_label(pred)
+        if int(gt) < 0:
+            src = ""
+            if 0 <= img_idx < len(self.last_sampled_sources):
+                src = Path(self.last_sampled_sources[img_idx]).name
+            title = f"Pred: {pred_name}"
+            if src:
+                title += f"  |  {src}"
+            return title, "white"
+        gt_name = self.format_class_label(gt)
+        correct = int(gt) == int(pred)
+        return (
+            f"GT: {gt_name}  |  Pred: {pred_name}",
+            "lime" if correct else "red",
+        )
+
+    def _save_inference_sources_json(self, inference_dir):
+        if not self.last_sampled_sources:
+            return
+        payload = [
+            {"img_idx": i, "source": src}
+            for i, src in enumerate(self.last_sampled_sources)
+        ]
+        path = Path(inference_dir) / "inference_sources.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"  已寫入 inference 來源對照: {path}")
 
     def extract_features_for_images(self, images, stage_idx, block_idx):
         """
@@ -2624,8 +2755,9 @@ class ViTAnalyzer:
         inference_dir = Path(save_dir) / "inference"
         inference_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n=== 隨機取 {m} 張圖推論 per-head cluster 指派 ===")
+        print(f"\n=== 取 {m if m is not None else '全部'} 張圖推論 per-head cluster 指派 ===")
         sample_imgs, sample_gt_labels = self.sample_random_images(m, seed=seed)
+        self._save_inference_sources_json(inference_dir)
         trace_jsonl_path = inference_dir / "gradcam_trace_clusters_head.jsonl"
 
         with torch.no_grad():
@@ -2643,11 +2775,7 @@ class ViTAnalyzer:
 
             gt = int(sample_gt_labels[img_idx].item())
             pred = int(sample_pred_labels[img_idx].item())
-            gt_name = self.format_class_label(gt)
-            pred_name = self.format_class_label(pred)
-            correct = (gt == pred)
-            title_color = "lime" if correct else "red"
-            title_str = f"GT: {gt_name}  |  Pred: {pred_name}"
+            title_str, title_color = self._inference_title(gt, pred, img_idx)
 
             fig, ax = plt.subplots(figsize=(4, 4.3))
             ax.imshow(img_np)
@@ -2757,8 +2885,9 @@ class ViTAnalyzer:
         inference_dir = save_dir / "inference"
         inference_dir.mkdir(parents=True, exist_ok=True)
         
-        print(f"\n=== 隨機取 {m} 張圖推論 cluster 指派 ===")
+        print(f"\n=== 取 {m if m is not None else '全部'} 張圖推論 cluster 指派 ===")
         sample_imgs, sample_gt_labels = self.sample_random_images(m, seed=seed)
+        self._save_inference_sources_json(inference_dir)
         trace_jsonl_path = inference_dir / "gradcam_trace_clusters.jsonl"
         
         with torch.no_grad():
@@ -2774,14 +2903,9 @@ class ViTAnalyzer:
             img = sample_imgs[img_idx]
             img_np = self._image_to_numpy(img)
 
-            # 顯示 GT 和 Pred 的 label 名稱
             gt = int(sample_gt_labels[img_idx].item())
             pred = int(sample_pred_labels[img_idx].item())
-            gt_name = self.format_class_label(gt)
-            pred_name = self.format_class_label(pred)
-            correct = (gt == pred)
-            title_color = "lime" if correct else "red"
-            title_str = f"GT: {gt_name}  |  Pred: {pred_name}"
+            title_str, title_color = self._inference_title(gt, pred, img_idx)
 
             fig, ax = plt.subplots(figsize=(4, 4.3))
             ax.imshow(img_np)
@@ -2985,6 +3109,7 @@ def run_dataset_analysis_all(
     trace_expansions_per_fig=2, save_all_inference_repr=False,
     analysis_split="auto",
     inference_split="test",
+    inference_image_dir=None,
     use_kmeans_cache=True,
     random_state=42,
 ):
@@ -3002,6 +3127,9 @@ def run_dataset_analysis_all(
                         讓 K-means 以訓練集分群。
         inference_split: "train"、"test"、"auto" 或 "same_as_analysis"。
                         預設使用 test，讓測試集做推論；auto 也會解析成 test。
+                        若指定 inference_image_dir，此參數會被忽略。
+        inference_image_dir: 手動指定 inference 圖片資料夾；若提供則依檔名排序取圖，
+                             m_inference=None 時取全部，否則取前 m 張。
         use_kmeans_cache: 是否啟用 K-means cache
         random_state: K-means 隨機種子
     """
@@ -3021,19 +3149,40 @@ def run_dataset_analysis_all(
     if split not in {"train", "test"}:
         raise ValueError(f"analysis_split 必須是 'auto'、'train' 或 'test'，目前收到: {analysis_split}")
     analysis_loader = train_loader if split == "train" else test_loader
-    infer_split = (inference_split or "test").lower()
-    if infer_split == "auto":
-        infer_split = "test"
-    if infer_split == "same_as_analysis":
-        infer_split = split
-    if infer_split not in {"train", "test"}:
-        raise ValueError(
-            "inference_split 必須是 'train'、'test' 或 'same_as_analysis'，"
-            f"目前收到: {inference_split}"
+
+    project_root = Path(__file__).resolve().parent.parent
+    if inference_image_dir:
+        infer_dir = Path(inference_image_dir)
+        if not infer_dir.is_absolute():
+            infer_dir = project_root / infer_dir
+        inference_loader = build_folder_inference_loader(
+            image_dir=infer_dir,
+            dataset_name=dataset,
+            img_size=img_size,
+            batch_size=1,
         )
-    inference_loader = train_loader if infer_split == "train" else test_loader
-    print(f"K-means analysis split: {split}")
-    print(f"Inference sampling split: {infer_split}")
+        # 資料夾模式：未指定 m_inference 時推論全部圖片
+        if m_inference is None:
+            m_inference = len(inference_loader.dataset)
+        print(f"K-means analysis split: {split}")
+        print(
+            f"Inference images: folder ({infer_dir.resolve()}, "
+            f"{len(inference_loader.dataset)} images, use first {m_inference})"
+        )
+    else:
+        infer_split = (inference_split or "test").lower()
+        if infer_split == "auto":
+            infer_split = "test"
+        if infer_split == "same_as_analysis":
+            infer_split = split
+        if infer_split not in {"train", "test"}:
+            raise ValueError(
+                "inference_split 必須是 'train'、'test' 或 'same_as_analysis'，"
+                f"目前收到: {inference_split}"
+            )
+        inference_loader = train_loader if infer_split == "train" else test_loader
+        print(f"K-means analysis split: {split}")
+        print(f"Inference sampling split: {infer_split}")
     display_mean = IMAGENET_MEAN if dataset == 'Caltech101' else None
     display_std = IMAGENET_STD if dataset == 'Caltech101' else None
     

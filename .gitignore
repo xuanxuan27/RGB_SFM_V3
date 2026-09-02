@@ -43,3 +43,4 @@ Caltech101_inference.tar.gz
 latex_export/
 
 sweep_log_*
+overnight_logs/

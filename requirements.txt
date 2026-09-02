@@ -2,6 +2,7 @@
 torch==2.4.1
 torchvision==0.19.1
 torchsummary==1.5.1
+timm==1.0.26  # MergingViT DropPath；VIT / Swin / PVTv2 也需要
 
 # Grad-CAM (import: pytorch_grad_cam)
 grad-cam==1.5.4
@@ -20,6 +21,7 @@ scikit-image==0.22.0
 # Scientific Computing
 scipy==1.15.3
 scikit-learn==1.7.0
+joblib==1.5.3  # K-means cache（.pkl dump/load）
 
 # Visualization
 matplotlib==3.10.3
